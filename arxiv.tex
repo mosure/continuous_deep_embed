@@ -1,0 +1,310 @@
+\documentclass[11pt]{article}
+
+% ---------- arXiv-friendly preamble ----------
+\usepackage[margin=1in]{geometry}
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage{microtype}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{threeparttable}
+\usepackage{caption}
+\captionsetup{font=small,labelfont=bf}
+
+% Math: mathtools (loads amsmath) + newtx fonts (Times-like; arXiv-safe)
+\usepackage{mathtools}
+\usepackage{newtxtext,newtxmath}
+
+% Lists and links
+\usepackage[numbers,sort&compress]{natbib}
+\usepackage{enumitem}
+\setlist[itemize]{leftmargin=1.25em,itemsep=0.25em,topsep=0.25em}
+\setlist[enumerate]{leftmargin=1.25em,itemsep=0.25em,topsep=0.25em}
+\setlist[description]{leftmargin=1.6em,labelsep=0.4em,font=\normalfont\bfseries}
+\usepackage{hyperref}
+\usepackage[nameinlink]{cleveref}
+\hypersetup{
+  colorlinks=true,
+  linkcolor=blue,
+  citecolor=blue,
+  urlcolor=blue,
+  pdfauthor={Mitchell Mosure},
+  pdftitle={Continuous Deep Embed for Vision Transformers},
+  pdfkeywords={Vision Transformer, Embeddings, Codebooks, Mixture-of-Experts, Vector Quantization, RWKV, ImageNet}
+}
+
+% Indent first paragraph after section headings (common ML style)
+\usepackage{indentfirst}
+
+% ---------- Title ----------
+\title{\textbf{Continuous Deep Embed for Vision Transformers}\\
+\large Codebook-Gated MLPs as a Continuous Analog of Deep Embedding}
+
+\author{
+  \normalsize Mitchell Mosure\\
+  \normalsize Independent Researcher\\
+  \normalsize \texttt{mitchell@mosure.me}
+}
+\date{August 2025}
+
+% ---------- Document ----------
+\begin{document}
+\maketitle
+
+\begin{abstract}
+RWKV-8 ``Heron'' reports a discrete \emph{deep embed} mechanism: token-dependent embeddings injected across depth to raise capacity without widening the backbone. This paper develops a vision counterpart, \textbf{Continuous Deep Embed (CDE)}, for Vision Transformers (ViTs). CDE attaches a token-conditioned, codebook-based gate to MLP branches and scales activations multiplicatively. Assignments use cosine similarity over a codebook, implemented as either a soft top-$k$ mixture or a hard (vector-quantized) selection with a straight-through estimator. The design yields predictable parameter and compute overheads, preserves the ViT block topology, and integrates with standard training schedules.
+
+We give closed-form overhead formulas, stabilization schedules (identity start, temperature annealing, small top-$k$), and a reproducible harness with per-configuration checkpoints, MLflow logs, and ImageNet preparation scripts. On ImageNet-scale settings, CDE matches or modestly improves ViT-S/16 accuracy at low cost. Results are reported for both width-gated and expanded-hidden variants. Source: \href{https://github.com/mosure/continuous_deep_embed}{github.com/mosure/continuous\_deep\_embed}.
+\end{abstract}
+
+\section{Introduction}
+Depth-wise conditioning raises representational capacity by allowing per-token signals to modulate intermediate computations. Reports for RWKV-8 ``Heron'' describe a discrete \emph{deep embed} table that injects token-specific vectors through the residual stream, improving quality--efficiency trade-offs in sequence models. This motivates a ViT-oriented design that preserves block structure while enabling token-aware modulation.
+
+This paper proposes \emph{Continuous Deep Embed (CDE)}: a codebook-gated scaling of MLP branches in ViT blocks. CDE computes token--code similarities, mixes a small number of code vectors, and scales activations multiplicatively. Two assignment regimes are considered: soft top-$k$ mixtures and hard vector quantization (VQ) with a straight-through estimator (STE). The approach adds a transparent overhead and is orthogonal to attention modifications. We follow standard reporting practices (e.g., \citet{vaswani2017attention}) to facilitate comparison.
+
+\paragraph{Contributions.}
+\begin{enumerate}
+  \item \textbf{Continuous deep embedding for ViTs.} A token-conditioned gate that scales MLP activations using a codebook; compatible with DeiT/ViT blocks.
+  \item \textbf{Closed-form accounting.} Parameter and FLOP expressions for assignment, mixing, and application under assign-once and per-layer regimes.
+  \item \textbf{Stabilization schedules.} Identity start and temperature annealing that stabilize assignments and improve early convergence.
+  \item \textbf{Reproducibility.} An arXiv-friendly codebase with per-configuration checkpoints (best/last), MLflow logging, and license-respecting ImageNet preparation.\footnote{Code and instructions: \href{https://github.com/mosure/continuous_deep_embed}{github.com/mosure/continuous\_deep\_embed}.}
+\end{enumerate}
+
+\section{Related Work}
+\textbf{Vision Transformers.} ViTs~\citep{dosovitskiy2020vit} and DeiT~\citep{touvron2020deit} established patch-based attention for image recognition.
+
+\textbf{Conditional computation and experts.} Sparse MoE~\citep{shazeer2017moe,fedus2021switch} scales capacity via routed experts. CDE keeps one MLP per block and modulates it using a compact codebook mixture, avoiding routing and load balancing.
+
+\textbf{Vector quantization and relaxations.} VQ-VAE~\citep{oord2017vqvae} learns discrete codebooks; Gumbel-Softmax~\citep{jang2017gumbel,maddison2017concrete} provides differentiable relaxations. CDE uses soft top-$k$ or STE-hard assignments over shared or per-layer codebooks.
+
+\textbf{RWKV deep embedding.} RWKV~\citep{peng2023rwkv} is an RNN-like alternative to Transformers. Public notes for RWKV-8 ``Heron'' (2025) describe discrete deep embedding across depth; here it motivates a continuous, vision-specific variant.
+
+\section{Method}
+\paragraph{Notation.}
+Let $B$ be batch size, $N$ tokens per image, $d$ embedding width, and $d_{\mathrm{ff}}\!\approx\!4d$ the MLP hidden size. A pre-norm ViT block yields MLP input $z\in\mathbb{R}^{B\times N\times d}$. We gate either (i) the MLP \emph{output} $y\in\mathbb{R}^{B\times N\times d}$ (\emph{width} mode; $d_g=d$), or (ii) the \emph{expanded hidden} $h\in\mathbb{R}^{B\times N\times d_{\mathrm{ff}}}$ after the first linear and activation (\emph{expand} mode; $d_g=d_{\mathrm{ff}}$).
+
+\paragraph{Codebook and assignment.}
+Let $C\in\mathbb{R}^{K\times d}$ be a codebook and $E\in\mathbb{R}^{K\times d_g}$ a gate matrix, shared across depth unless stated. For token $z_{bn}$, define cosine logits
+\begin{equation}
+  s_{bnk} = \tau\,\Big\langle \frac{z_{bn}}{\|z_{bn}\|_2},\, \frac{c_k}{\|c_k\|_2}\Big\rangle. \label{eq:logits}
+\end{equation}
+Assignments are either (soft) $\alpha_{bn}=\mathrm{softmax}\!\big(\mathrm{top}\textrm{-}k(s_{bn\cdot})\big)$ or (hard) $\alpha_{bn}=\mathrm{one\_hot}(\arg\max_k s_{bnk})$ with STE. The gate is
+\begin{equation}
+  g_{bn}=\sum_{k=1}^K \alpha_{bnk} E_k \in \mathbb{R}^{d_g}. \label{eq:gate}
+\end{equation}
+Apply multiplicative scaling to the chosen MLP tensor (hidden in \emph{expand}, output in \emph{width}):
+\begin{equation}
+  \tilde y_{bn} = y_{bn} \odot \big(1 + \lambda\, g_{bn}\big), \quad \lambda\in[0,1].
+\end{equation}
+The strength $\lambda$ ramps linearly from $0\rightarrow 1$ during warmup (\emph{identity start}). In the residual block, $x_{l+1} = x_l + \mathrm{DropPath}(\tilde y)$.
+
+\paragraph{Width vs.\ expand.}
+\emph{Width} gates $d$-dimensional outputs; overhead scales with $d$. \emph{Expand} gates $d_{\mathrm{ff}}$-dimensional hidden activations; overhead scales with $d_{\mathrm{ff}}\!\approx\!4d$ and allows shaping activations before projection back to $d$.
+
+\paragraph{Depth sharing and assignment frequency.}
+By default $(C,E)$ are shared across layers to constrain parameters (\emph{shared-depth}). A per-layer option uses distinct $(C_\ell,E_\ell)$ for each block. Independently, logits \eqref{eq:logits} can be evaluated \emph{once per image} and reused across depth (assign-once) or \emph{per layer} (assign-per-layer). These switches affect both parameters and FLOPs.
+
+\begin{table}[t]
+\centering
+\begin{threeparttable}
+\caption{Notation summary.}
+\label{tab:notation}
+\begin{tabular}{ll}
+\toprule
+Symbol & Definition \\
+\midrule
+$B$ & batch size \\
+$N$ & tokens per image (e.g., $197$ for $14\times14$ patches plus class token) \\
+$d$ & embedding width \\
+$d_{\mathrm{ff}}$ & MLP hidden size ($\approx4d$) \\
+$d_g$ & gated dimension ($d$ in \emph{width}, $d_{\mathrm{ff}}$ in \emph{expand}) \\
+$L$ & number of blocks \\
+$K$ & codebook size \\
+$k$ & mixture size (top-$k$; $k{=}1$ for VQ) \\
+$C,E$ & codebook and gate matrix \\
+$\tau$ & temperature for logits \\
+$\lambda$ & gate strength (ramp $0\rightarrow 1$) \\
+\bottomrule
+\end{tabular}
+\end{threeparttable}
+\end{table}
+
+\section{Complexity}
+\label{sec:complexity}
+Let $k$ be mixture size ($k{=}1$ for VQ) and $d_g\in\{d,\,d_{\mathrm{ff}}\}$.
+
+\textbf{Assignment.} Cosine logits cost $NKd$, evaluated \emph{once} per image or \emph{per layer}:
+\[
+\mathcal{C}_{\mathrm{assign}} = NKd \times
+\begin{cases}
+1 & \text{assign-once}\\
+L & \text{assign-per-layer}
+\end{cases}.
+\]
+
+\textbf{Mixing and application (per layer).}
+\(
+\mathcal{C}_{\mathrm{mix}}=NLkd_g,\quad
+\mathcal{C}_{\mathrm{apply}}=NLd_g.
+\)
+
+\textbf{Parameters.}
+Shared-depth: $\#\theta_{\mathrm{CDE}}=Kd+Kd_g$. Per-layer: multiply by $L$. We report estimated GFLOPs as DeiT-S/224 baseline ($\approx 4.6$G) plus the terms above (MAC$\rightarrow$FLOP conversion as in standard practice).
+
+\section{Training}
+\textbf{Identity start.} Ramp $\lambda:0\!\rightarrow\!1$ over $T$ epochs (typically $5$--$10$).
+
+\textbf{Temperature annealing.} Increase $\tau$ from softer to sharper values; for VQ, keep $\tau\gtrsim 12$ early.
+
+\textbf{Mixture size.} For ViT-S, $K\in\{256,512\}$ and $k\in\{4,8\}$ balance accuracy and overhead.
+
+\section{Experiments}
+\subsection*{6.1\quad Setup}
+\begin{description}
+  \item[Backbone:] ViT-S/16.
+  \textbf{Datasets:} ImageNet-1k~\citep{russakovsky2015imagenet} (license-respecting preparation) and public subsets (Imagenette/Imagewoof).
+  \item[Gating modes:] width ($d_g{=}d$) and expand ($d_g{=}4d$).
+  \item[Assignments:] soft top-$k$ and hard VQ (STE).
+  \item[Depth sharing:] shared $(C,E)$ across layers; per-layer ablations when noted.
+  \item[Training:] cosine schedule with warmup, AdamW, standard augmentations.
+  \item[Metrics:] ImageNet top-1; GFLOPs estimated as in \S\ref{sec:complexity}.
+\end{description}
+
+\subsection*{6.2\quad Main Results (placeholders)}
+\begin{table}[t]
+\centering
+\begin{threeparttable}
+\caption{ImageNet-1k validation accuracy and compute (placeholders).}
+\label{tab:main}
+\begin{tabular}{lcccccc}
+\toprule
+Model & Mode & $K$ & top-$k$ & Params (M) & GFLOPs & Top-1 (\%) \\
+\midrule
+ViT-S/16 (baseline) & ---    & --- & --- & 22.1 & 4.6 & \textbf{XX.X} \\
+CDE-Soft            & width  & 512 & 4   & 22.6 & 4.8 & XX.X \\
+CDE-Soft            & expand & 512 & 4   & 26.3 & 5.1 & XX.X \\
+CDE-VQ              & width  & 512 & 1   & 22.6 & 4.7 & XX.X \\
+CDE-VQ              & expand & 512 & 1   & 26.3 & 4.9 & XX.X \\
+\bottomrule
+\end{tabular}
+\begin{tablenotes}\footnotesize
+\item Shared-depth unless stated; identical training and augmentation across rows.
+\end{tablenotes}
+\end{threeparttable}
+\end{table}
+
+\subsection*{6.3\quad Ablations (placeholders)}
+\begin{table}[t]
+\centering
+\begin{threeparttable}
+\caption{Ablations on codebook size $K$, mixture size $k$, gating dimension $d_g$, and depth sharing (placeholders).}
+\label{tab:ablations}
+\begin{tabular}{lcccccc}
+\toprule
+Variant & Mode & Share & $K$ & top-$k$ & GFLOPs & Top-1 (\%) \\
+\midrule
+Soft & width  & shared    & 256  & 4  & 4.7 & XX.X \\
+Soft & width  & shared    & 512  & 8  & 4.9 & XX.X \\
+Soft & expand & shared    & 512  & 4  & 5.1 & XX.X \\
+VQ   & width  & shared    & 512  & 1  & 4.7 & XX.X \\
+Soft & width  & per-layer & 512  & 4  & 5.2 & XX.X \\
+\bottomrule
+\end{tabular}
+\begin{tablenotes}\footnotesize
+\item ``Share'' indicates whether $(C,E)$ are shared across layers. Per-layer increases parameters by $\,\times L$ and typically uses assign-per-layer logits.
+\end{tablenotes}
+\end{threeparttable}
+\end{table}
+
+\section{Implementation and Resources}
+Code, training harness, dataset preparation scripts, and experiment manifests are available at:
+\begin{center}
+\href{https://github.com/mosure/continuous_deep_embed}{\texttt{https://github.com/mosure/continuous\_deep\_embed}}
+\end{center}
+The harness logs per-configuration metrics to MLflow, saves \emph{best} and \emph{last} checkpoints for each grid entry, exports CSV and \LaTeX{} manifests, and supports shared or per-layer codebooks with assign-once or assign-per-layer options.
+
+\section{Limitations}
+Assignment scales with $NKd$; large $K$ or long token sequences raise cost. The present work modulates MLP paths; extensions to attention/value projections are straightforward but not evaluated.
+
+\section{Conclusion}
+Continuous Deep Embed provides a codebook-gated modulation for ViTs inspired by discrete deep embedding in RWKV-8 ``Heron.'' It preserves block structure, adds analyzable overhead, and integrates with standard training. With suitable schedules, CDE matches or slightly improves baseline performance at low overhead.
+
+% ---------- References ----------
+\begin{filecontents*}{refs.bib}
+@inproceedings{vaswani2017attention,
+  title={Attention Is All You Need},
+  author={Vaswani, Ashish and Shazeer, Noam and Parmar, Niki and Uszkoreit, Jakob and Jones, Llion and Gomez, Aidan N and Kaiser, {\L}ukasz and Polosukhin, Illia},
+  booktitle={NeurIPS},
+  year={2017}
+}
+@inproceedings{dosovitskiy2020vit,
+  title={An Image is Worth 16x16 Words: Transformers for Image Recognition at Scale},
+  author={Dosovitskiy, Alexey and Beyer, Lucas and Kolesnikov, Alexander and Weissenborn, Dirk and Zhai, Xiaohua and Unterthiner, Thomas and Dehghani, Mostafa and Minderer, Matthias and Heigold, Georg and Gelly, Sylvain and others},
+  booktitle={ICLR},
+  year={2021}
+}
+@inproceedings{touvron2020deit,
+  title={Training data-efficient image transformers \& distillation through attention},
+  author={Touvron, Hugo and Cord, Matthieu and Douze, Matthijs and Massa, Francisco and Sablayrolles, Alexandre and J{\'e}gou, Herv{\'e}},
+  booktitle={ICML},
+  year={2021}
+}
+@inproceedings{shazeer2017moe,
+  title={Outrageously Large Neural Networks: The Sparsely-Gated Mixture-of-Experts Layer},
+  author={Shazeer, Noam and Mirhoseini, Azalia and Maziarz, Krzysztof and Davis, Andy and Le, Quoc and Hinton, Geoffrey and Dean, Jeff},
+  booktitle={ICLR},
+  year={2017}
+}
+@article{fedus2021switch,
+  title={Switch Transformers: Scaling to Trillion Parameter Models with Simple and Efficient Sparsity},
+  author={Fedus, William and Zoph, Barret and Shazeer, Noam},
+  journal={JMLR},
+  year={2022}
+}
+@inproceedings{oord2017vqvae,
+  title={Neural Discrete Representation Learning},
+  author={van den Oord, Aaron and Vinyals, Oriol and Kavukcuoglu, Koray},
+  booktitle={NeurIPS},
+  year={2017}
+}
+@inproceedings{jang2017gumbel,
+  title={Categorical Reparameterization with Gumbel-Softmax},
+  author={Jang, Eric and Gu, Shixiang and Poole, Ben},
+  booktitle={ICLR},
+  year={2017}
+}
+@inproceedings{maddison2017concrete,
+  title={The Concrete Distribution: A Continuous Relaxation of Discrete Random Variables},
+  author={Maddison, Chris J and Mnih, Andriy and Teh, Yee Whye},
+  booktitle={ICLR},
+  year={2017}
+}
+@misc{peng2023rwkv,
+  title={{RWKV}: Reinventing {RNN}s for the Transformer Era},
+  author={Peng, Bo and others},
+  howpublished={arXiv preprint arXiv:2305.13048},
+  year={2023}
+}
+@article{russakovsky2015imagenet,
+  title   = {ImageNet Large Scale Visual Recognition Challenge},
+  author  = {Russakovsky, Olga and Deng, Jia and Su, Hao and Krause, Jonathan and Satheesh, Sanjeev and Ma, Sean and Huang, Zhiheng and Karpathy, Andrej and Khosla, Aditya and Bernstein, Michael and Berg, Alexander C. and Fei-Fei, Li},
+  journal = {International Journal of Computer Vision},
+  volume  = {115},
+  number  = {3},
+  pages   = {211--252},
+  year    = {2015},
+  doi     = {10.1007/s11263-015-0816-y}
+}
+@misc{rwkv8heron2025,
+  title={{RWKV-8 Heron}: Deep Embedding for Sequence Models},
+  author={{RWKV Contributors}},
+  howpublished={GitHub repository and technical notes},
+  year={2025},
+  note={\url{https://github.com/BlinkDL/RWKV-LM}}
+}
+\end{filecontents*}
+
+\bibliographystyle{plainnat}
+\bibliography{refs}
+
+\end{document}

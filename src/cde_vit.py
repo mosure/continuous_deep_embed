@@ -1,0 +1,978 @@
+# vit_s_continuous_deep_embed_experiments.py
+# ViT‑S/16 + Continuous Deep‑Embed (CDE) experimental harness
+# - Per‑config checkpoints (best/last) in dedicated subdirs
+# - Manifest CSV/LaTeX with checkpoint paths
+# - MLflow logging (grid parent + per‑config nested runs)
+# - Robust training: TF32, channels_last, grad accumulation, warmup‑cosine
+# - Windows-friendly DataLoader defaults; suppresses noisy third‑party logs
+
+# --- tame noisy third-party import logs (OpenVINO, HF telemetry) ---
+import os, warnings
+os.environ.setdefault("OPENVINO_LOG_LEVEL", "error")
+os.environ.setdefault("OV_LOG_LEVEL", "error")
+os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
+warnings.filterwarnings("ignore", module="openvino")
+
+import sys
+import math
+import json
+import time
+import argparse
+import random
+import csv
+import hashlib
+import datetime as _dt
+from dataclasses import dataclass, asdict
+from pathlib import Path
+from typing import List, Optional, Tuple, Dict, Any
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import DataLoader
+from torchvision import datasets, transforms
+
+# Optional deps (degrade gracefully)
+try:
+    import timm
+except Exception as _e:
+    timm = None
+
+try:
+    import mlflow
+    _HAVE_MLFLOW = True
+except Exception:
+    mlflow = None
+    _HAVE_MLFLOW = False
+
+import pandas as pd
+
+
+# ----------------------- small utilities ---------------------------------
+
+def now_utc() -> str:
+    return _dt.datetime.utcnow().strftime("%Y-%m-%dT%H-%M-%SZ")
+
+
+def sizeof_fmt(num: float, suffix="B") -> str:
+    for unit in ["", "K", "M", "G", "T", "P"]:
+        if abs(num) < 1024.0:
+            return f"{num:3.1f}{unit}{suffix}"
+        num /= 1024.0
+    return f"{num:.1f}E{suffix}"
+
+
+def set_seed(seed: int, deterministic: bool = False):
+    random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    if deterministic:
+        torch.use_deterministic_algorithms(True)
+        os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
+    else:
+        torch.backends.cudnn.benchmark = True
+    # TF32 for Ampere+ (faster matmul/conv with minimal accuracy impact)
+    if torch.cuda.is_available():
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        try:
+            torch.set_float32_matmul_precision('high')
+        except Exception:
+            pass
+
+
+def ensure_dir(p: Path):
+    p.mkdir(parents=True, exist_ok=True)
+
+
+def assert_imagenet_root(root: str):
+    train = Path(root) / "train"
+    val   = Path(root) / "val"
+    if not train.is_dir() or not val.is_dir():
+        raise FileNotFoundError(
+            f"--imagenet must point to a folder that has 'train' and 'val'. Got: {root}"
+        )
+
+
+def cfg_hash(cfg: "ExpCfg") -> str:
+    s = json.dumps(asdict(cfg), sort_keys=True)
+    return hashlib.sha1(s.encode("utf-8")).hexdigest()[:8]
+
+
+def cfg_slug(cfg: "ExpCfg") -> str:
+    topk = cfg.topk if cfg.topk is not None else "n"
+    cb = "cbS" if getattr(cfg, "share_codebook", True) else "cbL"
+    e  = "eS" if getattr(cfg, "share_E", False) else "eL"
+    return f"{cfg.gate}-K{cfg.K}-k{topk}-{cfg.d_g_mode}-t{cfg.tau:g}-{cb}-{e}"
+
+
+def cfg_dir(base: Path, idx: int, cfg: "ExpCfg") -> Path:
+    return base / f"{idx:02d}_{cfg_slug(cfg)}_{cfg_hash(cfg)}"
+
+
+# ----------------------- model: gates ------------------------------------
+
+class SoftCodebookGate(nn.Module):
+    """Soft top-k codebook gate: computes g(z)=Σ α_k E_k and scales target: target*(1+g)."""
+    def __init__(
+        self,
+        K: int,
+        d_in: int,
+        d_g: int,
+        tau: float = 10.0,
+        topk: int = 8,
+        share_codebook: Optional[nn.Parameter] = None,
+        share_E: Optional[nn.Parameter] = None,
+        normalize: bool = True,
+    ):
+        super().__init__()
+        self.codebook = share_codebook if share_codebook is not None \
+            else nn.Parameter(torch.randn(K, d_in) / math.sqrt(d_in))
+        if share_E is not None:
+            if share_E.shape != (K, d_g):
+                raise ValueError(f"shared E has shape {tuple(share_E.shape)}; expected {(K, d_g)}")
+            self.E = share_E
+        else:
+            self.E = nn.Parameter(torch.zeros(K, d_g))
+            nn.init.zeros_(self.E)
+        self.tau = tau
+        self.topk = topk
+        self.normalize = normalize
+
+    def forward(self, z, target):
+        # z: [B,N,d_in] (pre-MLP normed input), target: [B,N,d_g] (MLP hidden or output)
+        zf = F.normalize(z, dim=-1) if self.normalize else z
+        Cf = F.normalize(self.codebook, dim=-1) if self.normalize else self.codebook
+        logits = self.tau * torch.einsum('bnd,kd->bnk', zf, Cf)  # [B,N,K]
+        if self.topk is not None and self.topk < logits.shape[-1]:
+            vals, idx = torch.topk(logits, self.topk, dim=-1)       # [B,N,k]
+            alpha = F.softmax(vals, dim=-1)                          # [B,N,k]
+            Ek = self.E[idx]                                         # [B,N,k,d_g]
+            g = (alpha.unsqueeze(-1) * Ek).sum(dim=-2)               # [B,N,d_g]
+        else:
+            alpha = F.softmax(logits, dim=-1)                        # [B,N,K]
+            g = torch.einsum('bnk,kd->bnd', alpha, self.E)           # [B,N,d_g]
+        return target * (1.0 + g)
+
+
+class VQGate(nn.Module):
+    """Hard 1-of-K gate with straight-through estimator."""
+    def __init__(
+        self,
+        K: int,
+        d_in: int,
+        d_g: int,
+        tau: float = 20.0,
+        share_codebook: Optional[nn.Parameter] = None,
+        share_E: Optional[nn.Parameter] = None,
+        normalize: bool = True,
+    ):
+        super().__init__()
+        self.codebook = share_codebook if share_codebook is not None \
+            else nn.Parameter(torch.randn(K, d_in) / math.sqrt(d_in))
+        if share_E is not None:
+            if share_E.shape != (K, d_g):
+                raise ValueError(f"shared E has shape {tuple(share_E.shape)}; expected {(K, d_g)}")
+            self.E = share_E
+        else:
+            self.E = nn.Parameter(torch.zeros(K, d_g))
+            nn.init.zeros_(self.E)
+        self.tau = tau
+        self.normalize = normalize
+
+    def forward(self, z, target):
+        zf = F.normalize(z, dim=-1) if self.normalize else z
+        Cf = F.normalize(self.codebook, dim=-1) if self.normalize else self.codebook
+        logits = self.tau * torch.einsum('bnd,kd->bnk', zf, Cf)      # [B,N,K]
+        soft = F.softmax(logits, dim=-1)
+        hard_idx = torch.argmax(soft, dim=-1, keepdim=True)          # [B,N,1]
+        hard = torch.zeros_like(soft).scatter_(-1, hard_idx, 1.0)
+        alpha_st = (hard - soft).detach() + soft                     # STE
+        g = torch.einsum('bnk,kd->bnd', alpha_st, self.E)            # [B,N,d_g]
+        return target * (1.0 + g)
+
+
+class MlpWithGateWidth(nn.Module):
+    """Gate the MLP OUTPUT (dimension d)."""
+    def __init__(self, mlp: nn.Module, gate: nn.Module):
+        super().__init__()
+        self.mlp = mlp
+        self.gate = gate  # expects (z, y_out) -> y_out * (1+g)
+
+    def forward(self, x):
+        y = self.mlp(x)                # [B,N,d]
+        return self.gate(x, y)
+
+
+class MlpWithGateExpand(nn.Module):
+    """Gate the MLP HIDDEN after fc1/act/drop (dimension d_ff ≈ 4d)."""
+    def __init__(self, mlp: nn.Module, gate: nn.Module):
+        super().__init__()
+        self.mlp = mlp
+        # Be robust to timm variants
+        self.fc1 = getattr(mlp, 'fc1', getattr(mlp, 'linear1', None))
+        self.fc2 = getattr(mlp, 'fc2', getattr(mlp, 'linear2', None))
+        if self.fc1 is None or self.fc2 is None:
+            raise RuntimeError("Unsupported MLP structure: missing fc1/fc2 (or linear1/linear2).")
+        self.act = getattr(mlp, 'act', getattr(mlp, 'act_layer', nn.GELU()))
+        self.drop1 = getattr(mlp, 'drop1', getattr(mlp, 'drop', nn.Identity()))
+        self.drop2 = getattr(mlp, 'drop2', getattr(mlp, 'drop', nn.Identity()))
+        self.gate = gate               # expects (z, h) -> h * (1+g), g ∈ R^{d_ff}
+        # Expose hidden dim for budget inference post-wrapping
+        self.gate_hidden_dim = self.fc1.out_features
+
+    def forward(self, x):
+        h = self.fc1(x)
+        h = self.act(h)
+        h = self.drop1(h)              # [B,N,d_ff]
+        h = self.gate(x, h)            # gate at hidden
+        y = self.fc2(h)
+        y = self.drop2(y)              # [B,N,d]
+        return y
+
+
+def _infer_hidden_dim_from_mlp(mlp: nn.Module, fallback: int) -> int:
+    # works both before and after wrapping
+    if hasattr(mlp, 'gate_hidden_dim'):
+        return int(getattr(mlp, 'gate_hidden_dim'))
+    for obj in (mlp, getattr(mlp, 'mlp', None)):
+        if obj is None: continue
+        for name in ('fc1', 'linear1'):
+            if hasattr(obj, name) and hasattr(getattr(obj, name), 'out_features'):
+                return int(getattr(obj, name).out_features)
+    return int(fallback)
+
+
+def attach_gates(
+    vit: nn.Module,
+    kind: str = 'soft',
+    K: int = 512,
+    d_g_mode: str = 'expand',  # 'expand' (4d) or 'width' (d)
+    topk: Optional[int] = 8,
+    tau: float = 10.0,
+    share_codebook_across_depth: bool = True,
+    share_E_across_depth: bool = False,
+):
+    """Attach a gate to every block's MLP with optional sharing across depth."""
+    d_in = vit.embed_dim
+
+    # optional shared codebook across depth
+    codebook_shared: Optional[nn.Parameter] = None
+    if share_codebook_across_depth:
+        codebook_shared = nn.Parameter(torch.randn(K, d_in) / math.sqrt(d_in))
+        vit.register_parameter('deepembed_codebook', codebook_shared)
+
+    # optional shared E across depth (shape depends on d_g_mode)
+    E_shared: Optional[nn.Parameter] = None
+    if share_E_across_depth:
+        d_g_example = d_in if d_g_mode == 'width' else _infer_hidden_dim_from_mlp(vit.blocks[0].mlp, fallback=4 * d_in)
+        E_shared = nn.Parameter(torch.zeros(K, d_g_example))
+        vit.register_parameter('deepembed_E', E_shared)
+
+    for li, blk in enumerate(vit.blocks):
+        # before wrapping: read hidden dim from original mlp
+        d_ff = _infer_hidden_dim_from_mlp(blk.mlp, fallback=4 * d_in)
+        d_g = d_ff if d_g_mode == 'expand' else d_in
+
+        # choose per-block or shared params
+        cb_param = codebook_shared
+        if cb_param is None:  # per-layer codebook
+            cb_param = nn.Parameter(torch.randn(K, d_in) / math.sqrt(d_in))
+            setattr(blk, f'deepembed_codebook_{li:02d}', cb_param)  # register under block for clarity
+
+        gate_cls = SoftCodebookGate if kind == 'soft' else VQGate
+        gate = gate_cls(K, d_in, d_g, tau=(tau if kind == 'soft' else max(12.0, tau)),
+                        topk=(topk if kind == 'soft' else 1),
+                        share_codebook=cb_param, share_E=E_shared)
+
+        if d_g_mode == 'expand':
+            blk.mlp = MlpWithGateExpand(blk.mlp, gate)
+        else:
+            blk.mlp = MlpWithGateWidth(blk.mlp, gate)
+
+
+# ----------------------- accounting --------------------------------------
+
+BASELINE_GFLOPS_DEIT_S_224 = 4.6  # reported (MAC-based)
+
+@dataclass
+class Budget:
+    params_m: float
+    est_gflops_total: float
+    est_gflops_overhead: float
+
+
+def count_params_m(model: nn.Module) -> float:
+    return sum(p.numel() for p in model.parameters()) / 1e6
+
+
+def estimate_gate_overhead_gflops(
+    K: int,
+    d_in: int,
+    d_g: int,
+    N: int,
+    L: int,
+    k: int,
+    assign_once: bool = True,
+) -> float:
+    # assignment cost: N*K*d_in (once or per-layer)
+    assign = (N * K * d_in) * (1 if assign_once else L)
+    # mixing cost (soft top-k): N*L*k*d_g; vq has k=1 but we still do one gather
+    mix = N * L * k * d_g
+    # apply gate (mul): N*L*d_g
+    apply = N * L * d_g
+    return (assign + mix + apply) / 1e9
+
+
+def _infer_d_g(model: nn.Module, d_g_mode: str) -> int:
+    if d_g_mode != 'expand':
+        return int(model.embed_dim)
+    # after wrapping, the mlp may be a wrapper; use robust inference
+    try:
+        mlp0 = model.blocks[0].mlp
+        return _infer_hidden_dim_from_mlp(mlp0, fallback=4 * model.embed_dim)
+    except Exception:
+        return int(4 * model.embed_dim)
+
+
+def compute_budget(
+    model: nn.Module,
+    gate: str,
+    K: int,
+    topk: Optional[int],
+    d_g_mode: str,
+    assign_once: bool,
+    tokens: int = 197,
+    share_codebook: bool = True,
+) -> Budget:
+    d_in = model.embed_dim
+    L = len(model.blocks)
+    d_g = _infer_d_g(model, d_g_mode)
+    k = 1 if gate == 'vq' else (topk or K)
+    # If codebook is per-layer, assignment must be per-layer
+    eff_assign_once = assign_once and share_codebook
+    overhead = 0.0 if gate == 'none' else estimate_gate_overhead_gflops(
+        K, d_in, d_g, tokens, L, k, assign_once=eff_assign_once
+    )
+    total = BASELINE_GFLOPS_DEIT_S_224 + overhead
+    return Budget(count_params_m(model), total, overhead)
+
+
+# ----------------------- data --------------------------------------------
+
+IMAGENET_MEAN = [0.485, 0.456, 0.406]
+IMAGENET_STD  = [0.229, 0.224, 0.225]
+
+
+def make_imagenet_loaders(
+    root: str,
+    bs: int,
+    workers: Optional[int] = None,
+    size: int = 224,
+    ddp: bool = False,
+    rank: int = 0,
+    world_size: int = 1,
+):
+    """Create loaders; on Windows, default to workers=0 to avoid spawn spam unless user overrides."""
+    if workers is None:
+        workers = 0 if os.name == "nt" else min(8, os.cpu_count() or 8)
+
+    train_tf = transforms.Compose([
+        transforms.RandomResizedCrop(size, scale=(0.08, 1.0),
+                                     interpolation=transforms.InterpolationMode.BICUBIC),
+        transforms.RandomHorizontalFlip(),
+        transforms.ToTensor(),
+        transforms.Normalize(IMAGENET_MEAN, IMAGENET_STD),
+    ])
+    val_tf = transforms.Compose([
+        transforms.Resize(int(size * 256 / 224),
+                          interpolation=transforms.InterpolationMode.BICUBIC),
+        transforms.CenterCrop(size),
+        transforms.ToTensor(),
+        transforms.Normalize(IMAGENET_MEAN, IMAGENET_STD),
+    ])
+    train_ds = datasets.ImageFolder(os.path.join(root, 'train'), train_tf)
+    val_ds   = datasets.ImageFolder(os.path.join(root, 'val'),   val_tf)
+
+    if rank == 0:
+        print(f"[data] {root} -> train={len(train_ds)}  val={len(val_ds)}  classes={len(train_ds.classes)}", flush=True)
+
+    train_sampler = None
+    val_sampler = None
+    if ddp and world_size > 1:
+        from torch.utils.data.distributed import DistributedSampler
+        train_sampler = DistributedSampler(train_ds, num_replicas=world_size, rank=rank, shuffle=True, drop_last=False)
+        val_sampler   = DistributedSampler(val_ds,   num_replicas=world_size, rank=rank, shuffle=False, drop_last=False)
+
+    pin = torch.cuda.is_available()
+    persistent = workers > 0
+
+    train_loader = DataLoader(
+        train_ds, batch_size=bs, shuffle=(train_sampler is None),
+        sampler=train_sampler, num_workers=workers, pin_memory=pin,
+        persistent_workers=persistent
+    )
+    val_loader = DataLoader(
+        val_ds, batch_size=bs, shuffle=False,
+        sampler=val_sampler, num_workers=workers, pin_memory=pin,
+        persistent_workers=persistent
+    )
+    return train_loader, val_loader, len(train_ds.classes)
+
+
+# ----------------------- training utils ----------------------------------
+
+class WarmupCosine(torch.optim.lr_scheduler._LRScheduler):
+    def __init__(self, optimizer, warmup_epochs, max_epochs, last_epoch=-1):
+        self.warmup_epochs = warmup_epochs
+        self.max_epochs = max_epochs
+        super().__init__(optimizer, last_epoch)
+
+    def get_lr(self):
+        ep = self.last_epoch + 1
+        if ep <= self.warmup_epochs:
+            return [base_lr * ep / max(1, self.warmup_epochs) for base_lr in self.base_lrs]
+        # cosine decay
+        t = (ep - self.warmup_epochs) / max(1, self.max_epochs - self.warmup_epochs)
+        cos = 0.5 * (1 + math.cos(math.pi * t))
+        return [base_lr * cos for base_lr in self.base_lrs]
+
+
+def build_param_groups(model: nn.Module, weight_decay: float) -> List[Dict[str, Any]]:
+    """AdamW param groups with no weight decay for biases/LayerNorms."""
+    decay, no_decay = [], []
+    for n, p in model.named_parameters():
+        if not p.requires_grad: continue
+        if n.endswith(".bias") or "norm" in n.lower():
+            no_decay.append(p)
+        else:
+            decay.append(p)
+    return [
+        {"params": decay, "weight_decay": weight_decay},
+        {"params": no_decay, "weight_decay": 0.0},
+    ]
+
+
+@torch.no_grad()
+def evaluate_top1(model: nn.Module, loader: DataLoader, device: torch.device) -> float:
+    model.eval()
+    tot = correct = 0
+    for x, y in loader:
+        x = x.to(device, non_blocking=True)
+        y = y.to(device, non_blocking=True)
+        logits = model(x)
+        pred = logits.argmax(dim=1)
+        correct += (pred == y).sum().item()
+        tot += y.numel()
+    return 100.0 * correct / max(1, tot)
+
+
+# ----------------------- MLflow & checkpoints ----------------------------
+
+class MLflowLogger:
+    def __init__(self, enabled: bool, exp_name: str, run_name: str, tags: Dict[str, Any]):
+        self.enabled = enabled and _HAVE_MLFLOW
+        self.run = None
+        if not self.enabled:
+            return
+        try:
+            if exp_name:
+                mlflow.set_experiment(exp_name)
+            self.run = mlflow.start_run(run_name=run_name)
+            if tags:
+                mlflow.set_tags(tags)
+        except Exception:
+            self.enabled = False
+            self.run = None
+
+    def child(self, run_name: str):
+        if not self.enabled: return self
+        try:
+            mlflow.start_run(run_name=run_name, nested=True)
+        except Exception:
+            pass
+        return self
+
+    def end_child(self):
+        if not self.enabled: return
+        try: mlflow.end_run()
+        except Exception: pass
+
+    def log_params(self, params: Dict[str, Any]):
+        if not self.enabled: return
+        try: mlflow.log_params(params)
+        except Exception: pass
+
+    def log_metrics(self, metrics: Dict[str, float], step: Optional[int] = None):
+        if not self.enabled: return
+        try: mlflow.log_metrics(metrics, step=step)
+        except Exception: pass
+
+    def log_artifact(self, path: str):
+        if not self.enabled: return
+        try: mlflow.log_artifact(path)
+        except Exception: pass
+
+    def log_artifacts(self, dir_path: str):
+        if not self.enabled: return
+        try: mlflow.log_artifacts(dir_path)
+        except Exception: pass
+
+    def end(self):
+        if not self.enabled or self.run is None: return
+        try: mlflow.end_run()
+        except Exception: pass
+
+
+def save_checkpoint_pair(cfg_out: Path, state: Dict[str, Any], is_best: bool):
+    ensure_dir(cfg_out)
+    last_path = cfg_out / "ckpt_last.pt"
+    torch.save(state, last_path)
+    if is_best:
+        best_path = cfg_out / "ckpt_best.pt"
+        torch.save(state, best_path)
+    return str(last_path), (str(cfg_out / "ckpt_best.pt") if is_best else None)
+
+
+def load_checkpoint(path: str, model: nn.Module, opt=None, sched=None, scaler=None) -> Tuple[int, float]:
+    ckpt = torch.load(path, map_location="cpu")
+    model.load_state_dict(ckpt["model"], strict=True)
+    if opt and "opt" in ckpt: opt.load_state_dict(ckpt["opt"])
+    if sched and "sched" in ckpt: sched.load_state_dict(ckpt["sched"])
+    if scaler and "scaler" in ckpt: scaler.load_state_dict(ckpt["scaler"])
+    start_epoch = ckpt.get("epoch", 0)
+    best = ckpt.get("best_acc1", float("-inf"))
+    print(f"[resume] loaded {path} (epoch={start_epoch}, best={best:.2f})")
+    return start_epoch, best
+
+
+# ----------------------- experiment grid ---------------------------------
+
+@dataclass
+class ExpCfg:
+    gate: str            # 'none' | 'vq' | 'soft'
+    K: int               # codebook size
+    topk: Optional[int]  # for soft; None for vq/none
+    d_g_mode: str        # 'width' | 'expand'
+    tau: float           # temperature
+    assign_once: bool    # for est flops only
+    # NEW: depth sharing toggles
+    share_codebook: bool = True  # True: one codebook across depth; False: per-layer codebook
+    share_E: bool = False        # True: one E across depth; False: per-layer E (default)
+
+
+def build_model(cfg: ExpCfg, num_classes: int = 1000) -> nn.Module:
+    if timm is None:
+        raise RuntimeError("timm is required (pip install timm).")
+    model = timm.create_model('deit_small_patch16_224', pretrained=False, num_classes=num_classes)
+    if cfg.gate != 'none':
+        attach_gates(
+            model, kind=cfg.gate, K=cfg.K, d_g_mode=cfg.d_g_mode,
+            topk=cfg.topk, tau=cfg.tau,
+            share_codebook_across_depth=cfg.share_codebook,
+            share_E_across_depth=cfg.share_E,
+        )
+    return model
+
+
+def exp_row_dict(cfg: ExpCfg, budget: Budget, acc1: Optional[float], epochs: int,
+                 cfg_rel_dir: str, last_rel: Optional[str], best_rel: Optional[str]) -> dict:
+    return {
+        'model': 'ViT-S/16',
+        'gate': cfg.gate,
+        'K': cfg.K if cfg.gate != 'none' else '-',
+        'topk': cfg.topk if cfg.gate == 'soft' else '-',
+        'd_g': cfg.d_g_mode,
+        'assign_once': cfg.assign_once,
+        'cb_shared': cfg.share_codebook,
+        'E_shared': cfg.share_E,
+        'params_M': round(budget.params_m, 3),
+        'GFLOPs_total': round(budget.est_gflops_total, 3),
+        'GFLOPs_overhead': round(budget.est_gflops_overhead, 3),
+        'epochs': epochs,
+        'top1_acc': None if acc1 is None else round(acc1, 2),
+        'ckpt_dir': cfg_rel_dir,
+        'ckpt_last': last_rel or '-',
+        'ckpt_best': best_rel or '-',
+    }
+
+
+def default_grid() -> List[ExpCfg]:
+    return [
+        ExpCfg('none', 0, None, 'width', 0.0, True),
+        ExpCfg('vq', 512, None, 'width', 20.0, True),
+        ExpCfg('vq', 512, None, 'expand', 20.0, True),
+        ExpCfg('soft', 512, 8, 'width', 10.0, True),
+        ExpCfg('soft', 512, 8, 'expand', 10.0, True),
+    ]
+
+
+def load_grid(arg: str) -> List[ExpCfg]:
+    """Accept 'default' | 'smoke' | path to JSON (list of dicts)."""
+    PREDEF = {
+        "smoke": [
+            {"gate":"none","K":0,"topk":None,"d_g_mode":"width","tau":10.0,"assign_once":True},
+            {"gate":"vq","K":512,"topk":None,"d_g_mode":"width","tau":20.0,"assign_once":True},
+            {"gate":"soft","K":512,"topk":8,"d_g_mode":"width","tau":10.0,"assign_once":True},
+        ]
+    }
+    if arg == 'default':
+        data = [asdict(x) for x in default_grid()]
+    elif os.path.isfile(arg):
+        with open(arg, 'r') as f:
+            data = json.load(f)
+    elif arg in PREDEF:
+        data = PREDEF[arg]
+    else:
+        raise FileNotFoundError(f"grid '{arg}' not found (file or predefined 'default'/'smoke').")
+
+    norm: List[ExpCfg] = []
+    for g in data:
+        g = dict(g)
+        # legacy alias support
+        if "dg" in g and "d_g_mode" not in g:
+            g["d_g_mode"] = g.pop("dg")
+        if g.get("topk") in (0, "0"):
+            g["topk"] = None
+        g.setdefault("assign_once", True)
+        # NEW: sharing defaults + aliases
+        # aliases: codebook_per_layer / cb_per_layer -> share_codebook = not(...)
+        if "share_codebook" not in g:
+            per_layer_alias = g.pop("codebook_per_layer", None)
+            per_layer_alias = g.pop("cb_per_layer", per_layer_alias)
+            if per_layer_alias is not None:
+                g["share_codebook"] = (not bool(per_layer_alias))
+            else:
+                g["share_codebook"] = True
+        g.setdefault("share_E", False)
+        norm.append(ExpCfg(**g))
+    return norm
+
+
+def write_csv_and_latex(rows: List[dict], out_dir: Path, fname: str = 'results'):
+    if not rows: return
+    ensure_dir(out_dir)
+    csv_path = out_dir / f'{fname}.csv'
+    tex_path = out_dir / f'{fname}.tex'
+
+    # CSV
+    with open(csv_path, 'w', newline='') as f:
+        w = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+        w.writeheader()
+        for r in rows:
+            w.writerow(r)
+
+    # LaTeX
+    cols = ['model','gate','K','topk','d_g','assign_once','cb_shared','E_shared',
+            'params_M','GFLOPs_total','GFLOPs_overhead','epochs','top1_acc',
+            'ckpt_dir','ckpt_last','ckpt_best']
+    header = ' & '.join(cols) + ' \\\\'
+    lines = [
+        '% auto-generated table',
+        '\\begin{tabular}{l l r r l l l l r r r r r l l l}',
+        '\\toprule',
+        header,
+        '\\midrule',
+    ]
+    for r in rows:
+        vals = [str(r[c]) for c in cols]
+        lines.append(' & '.join(vals) + ' \\\\')
+    lines.append('\\bottomrule')
+    lines.append('\\end{tabular}')
+    with open(tex_path, 'w') as f:
+        f.write('\n'.join(lines))
+    print(f'wrote {csv_path}')
+    print(f'wrote {tex_path}')
+
+
+# ----------------------- main --------------------------------------------
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument('--imagenet', type=str, required=True,
+                    help='path to ImageNet/Imagenette root with train/ and val/')
+    ap.add_argument('--grid', type=str, default='default',
+                    help="grid: 'default' | 'smoke' | path to JSON")
+    ap.add_argument('--epochs', type=int, default=100)
+    ap.add_argument('--warmup', type=int, default=5)
+    ap.add_argument('--bs', type=int, default=256)
+    ap.add_argument('--accum', type=int, default=1, help='gradient accumulation steps')
+    ap.add_argument('--workers', type=int, default=None,
+                    help='num dataloader workers (default: 0 on Windows, 8 otherwise)')
+    ap.add_argument('--lr', type=float, default=5e-4)
+    ap.add_argument('--wd', type=float, default=0.05)
+    ap.add_argument('--clip', type=float, default=1.0, help='grad-norm clip (0 disables)')
+    ap.add_argument('--label_smoothing', type=float, default=0.0)
+    ap.add_argument('--no_amp', action='store_true')
+    ap.add_argument('--assign_once', action='store_true',
+                    help='compute est flops with assignment once (budgets only)')
+    ap.add_argument('--device', type=str, default='cuda')
+    ap.add_argument('--seed', type=int, default=1337)
+    ap.add_argument('--deterministic', action='store_true')
+    ap.add_argument('--out_dir', type=str, default=f'runs/exp_{now_utc()}')
+    ap.add_argument('--skip_train', action='store_true',
+                    help='only compute budgets, skip training')
+    ap.add_argument('--save_every', type=int, default=1, help='save checkpoint every N epochs')
+    ap.add_argument('--keep_snapshots', action='store_true',
+                    help='also save ckpt_eXXX.pt per epoch (disk heavy)')
+    ap.add_argument('--resume', type=str, default=None,
+                    help='path/to/ckpt_last.pt to resume (manual)')
+    ap.add_argument('--resume_auto', action='store_true',
+                    help='auto resume per-config if its ckpt_last.pt exists')
+    # DDP (optional; use torchrun)
+    ap.add_argument('--ddp', action='store_true', help='enable DDP if launched with torchrun')
+    ap.add_argument('--ddp_backend', type=str, default='nccl', help='nccl|gloo')
+    # MLflow
+    ap.add_argument('--mlflow', action='store_true', help='enable MLflow logging if installed')
+    ap.add_argument('--mlflow_exp', type=str, default='CDE-ViT')
+    ap.add_argument('--mlflow_run', type=str, default=None)
+    args = ap.parse_args()
+
+    # rank/world detection
+    rank = int(os.environ.get("RANK", "0"))
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    ddp_active = args.ddp and world_size > 1
+
+    if ddp_active:
+        torch.distributed.init_process_group(backend=args.ddp_backend)
+        torch.cuda.set_device(rank % max(1, torch.cuda.device_count()))
+
+    # seed & device
+    set_seed(args.seed, deterministic=args.deterministic)
+    device = torch.device(args.device if torch.cuda.is_available() else 'cpu')
+
+    # i/o
+    out_dir = Path(args.out_dir)
+    ensure_dir(out_dir)
+    (out_dir / "meta").mkdir(exist_ok=True, parents=True)
+
+    # persist config
+    if rank == 0:
+        with open(out_dir / "meta" / "args.json", "w") as f:
+            json.dump(vars(args), f, indent=2)
+
+    # dataset sanity
+    assert_imagenet_root(args.imagenet)
+
+    # grid
+    grid = load_grid(args.grid)
+
+    # mlflow parent run
+    run_name = args.mlflow_run or f"{Path(__file__).stem}-{now_utc()}"
+    mlf = MLflowLogger(args.mlflow and (rank == 0), args.mlflow_exp, run_name,
+                       tags={"host": os.uname().nodename if hasattr(os, "uname") else "win",
+                             "grid": args.grid})
+
+    rows: List[dict] = []
+    try:
+        # data
+        train_loader, val_loader, num_classes = make_imagenet_loaders(
+            args.imagenet, args.bs, workers=args.workers, size=224,
+            ddp=ddp_active, rank=rank, world_size=world_size
+        )
+
+        if rank == 0:
+            mlf.log_params({
+                "epochs": args.epochs, "warmup": args.warmup,
+                "bs": args.bs, "accum": args.accum, "workers": (0 if args.workers is None and os.name=="nt" else (args.workers or 8)),
+                "lr": args.lr, "wd": args.wd, "clip": args.clip, "label_smoothing": args.label_smoothing,
+                "amp": (not args.no_amp), "assign_once": args.assign_once, "num_classes": num_classes,
+                "ddp": ddp_active, "world_size": world_size
+            })
+
+        # loss
+        ce = nn.CrossEntropyLoss(label_smoothing=args.label_smoothing).to(device)
+
+        for j, cfg in enumerate(grid):
+            cfg_out = cfg_dir(out_dir, j, cfg)
+            if rank == 0:
+                ensure_dir(cfg_out)
+                # persist cfg/budget placeholders early
+                with open(cfg_out / "cfg.json", "w") as f: json.dump(asdict(cfg), f, indent=2)
+
+            if rank == 0:
+                print(f'\n== experiment {j+1}/{len(grid)}: {cfg} => {cfg_out.name}\n', flush=True)
+
+            # nested MLflow run per-config
+            if rank == 0:
+                mlf.child(run_name=f"{j:02d}_{cfg_slug(cfg)}")
+
+            # model
+            model = build_model(cfg, num_classes=num_classes)
+            model.to(device)
+            if torch.cuda.is_available():
+                model.to(memory_format=torch.channels_last)
+            if ddp_active:
+                from torch.nn.parallel import DistributedDataParallel as DDP
+                model = DDP(model, device_ids=[rank % max(1, torch.cuda.device_count())],
+                            output_device=rank % max(1, torch.cuda.device_count()),
+                            broadcast_buffers=False)
+
+            # budget (note: assign_once only valid when codebook is shared)
+            budget = compute_budget(model.module if ddp_active else model,
+                                    cfg.gate, cfg.K, cfg.topk, cfg.d_g_mode,
+                                    cfg.assign_once, share_codebook=cfg.share_codebook)
+            if rank == 0:
+                print(f'params(M)={budget.params_m:.3f}  '
+                      f'est_total_GFLOPs={budget.est_gflops_total:.3f}  '
+                      f'overhead={budget.est_gflops_overhead:.3f}', flush=True)
+                with open(cfg_out / "budget.json", "w") as f: json.dump(asdict(budget), f, indent=2)
+                mlf.log_params({
+                    "cfg_gate": cfg.gate, "cfg_K": cfg.K, "cfg_topk": cfg.topk,
+                    "cfg_d_g_mode": cfg.d_g_mode, "cfg_tau": cfg.tau, "cfg_assign_once": cfg.assign_once,
+                    "cfg_cb_shared": cfg.share_codebook, "cfg_E_shared": cfg.share_E,
+                    "params_M": round(budget.params_m, 3),
+                    "GFLOPs_total": round(budget.est_gflops_total, 3),
+                    "GFLOPs_overhead": round(budget.est_gflops_overhead, 3),
+                })
+
+            # optim/sched/amp
+            param_groups = build_param_groups(model, args.wd)
+            opt = torch.optim.AdamW(param_groups, lr=args.lr, betas=(0.9, 0.999))
+            sched = WarmupCosine(opt, warmup_epochs=args.warmup, max_epochs=args.epochs)
+            scaler = torch.cuda.amp.GradScaler(enabled=(not args.no_amp))
+
+            # resume?
+            start_epoch = 0
+            best_acc1 = float("-inf")
+            if args.resume:
+                start_epoch, best_acc1 = load_checkpoint(args.resume, model, opt, sched, scaler)
+            elif args.resume_auto:
+                auto = cfg_out / "ckpt_last.pt"
+                if auto.is_file():
+                    start_epoch, best_acc1 = load_checkpoint(str(auto), model, opt, sched, scaler)
+
+            # training
+            acc1 = None
+            last_rel = None
+            best_rel = None
+
+            if not args.skip_train:
+                for ep in range(start_epoch, args.epochs):
+                    if ddp_active and hasattr(train_loader.sampler, "set_epoch"):
+                        train_loader.sampler.set_epoch(ep)
+
+                    model.train()
+                    t0 = time.time()
+                    if torch.cuda.is_available():
+                        torch.cuda.reset_peak_memory_stats(device)
+
+                    tot_loss = 0.0
+                    seen = 0
+                    steps = len(train_loader)
+                    accum = max(1, args.accum)
+                    opt.zero_grad(set_to_none=True)
+
+                    for i, (x, y) in enumerate(train_loader):
+                        x = x.to(device, non_blocking=True).to(memory_format=torch.channels_last)
+                        y = y.to(device, non_blocking=True)
+                        with torch.cuda.amp.autocast(enabled=(not args.no_amp)):
+                            logits = model(x)
+                            loss = ce(logits, y) / accum
+                        scaler.scale(loss).backward()
+
+                        if (i + 1) % accum == 0 or (i + 1) == steps:
+                            if args.clip and args.clip > 0:
+                                scaler.unscale_(opt)
+                                nn.utils.clip_grad_norm_(model.parameters(), args.clip)
+                            scaler.step(opt)
+                            scaler.update()
+                            opt.zero_grad(set_to_none=True)
+
+                        tot_loss += loss.item() * accum * x.size(0)
+                        seen += x.size(0)
+
+                        # progress (rank 0)
+                        if rank == 0 and (i + 1) % max(1, steps // 10) == 0:
+                            print(f'ep {ep+1}/{args.epochs} it {i+1}/{steps} '
+                                  f'loss {tot_loss/max(1,seen):.4f}', flush=True)
+
+                    sched.step()
+                    dt = time.time() - t0
+                    imgs_per_s = seen / max(1e-6, dt)
+                    acc1 = evaluate_top1(model, val_loader, device)
+
+                    if rank == 0:
+                        max_mem = torch.cuda.max_memory_allocated(device) if torch.cuda.is_available() else 0
+                        print(f'epoch {ep+1}/{args.epochs} acc1={acc1:.2f}% '
+                              f'loss={tot_loss/max(1,seen):.4f} '
+                              f'time={dt:.1f}s ({imgs_per_s:.1f} img/s) '
+                              f'gpu_mem={sizeof_fmt(max_mem)}', flush=True)
+                        mlf.log_metrics({
+                            "acc1": float(acc1),
+                            "loss": float(tot_loss/max(1,seen)),
+                            "imgs_per_s": float(imgs_per_s)
+                        }, step=ep+1)
+
+                        # checkpoints (per-config)
+                        is_save_epoch = ((ep + 1) % max(1, args.save_every) == 0) or (ep + 1 == args.epochs)
+                        if is_save_epoch:
+                            base_state = {
+                                "epoch": ep + 1,
+                                "best_acc1": max(best_acc1, acc1 if acc1 is not None else float("-inf")),
+                                "model": (model.module if hasattr(model, "module") else model).state_dict(),
+                                "opt": opt.state_dict(),
+                                "sched": sched.state_dict(),
+                                "scaler": scaler.state_dict(),
+                                "cfg": asdict(cfg),
+                                "args": vars(args)
+                            }
+                            last_path, new_best = save_checkpoint_pair(cfg_out, base_state, is_best=(acc1 >= best_acc1))
+                            last_rel = str(Path(last_path).relative_to(out_dir))
+                            if new_best:
+                                best_rel = str(Path(new_best).relative_to(out_dir))
+                                best_acc1 = acc1
+                            if args.keep_snapshots:
+                                snap = cfg_out / f"ckpt_e{ep+1:03d}_a{acc1:.2f}.pt"
+                                torch.save(base_state, snap)
+
+                # metrics.json per-config
+                if rank == 0:
+                    with open(cfg_out / "metrics.json", "w") as f:
+                        json.dump({
+                            "acc1_last": acc1,
+                            "acc1_best": best_acc1 if best_acc1 != float("-inf") else None
+                        }, f, indent=2)
+
+            # end of one config
+            if rank == 0:
+                # in case of skip_train, derive rel paths if any existing
+                if last_rel is None and (cfg_out / "ckpt_last.pt").is_file():
+                    last_rel = str((cfg_out / "ckpt_last.pt").relative_to(out_dir))
+                if best_rel is None and (cfg_out / "ckpt_best.pt").is_file():
+                    best_rel = str((cfg_out / "ckpt_best.pt").relative_to(out_dir))
+
+                row = exp_row_dict(cfg, budget, acc1, args.epochs if not args.skip_train else 0,
+                                   str(cfg_out.relative_to(out_dir)), last_rel, best_rel)
+                rows.append(row)
+                write_csv_and_latex(rows, out_dir, fname='results')
+                # log artifacts (per-config dir)
+                mlf.log_artifacts(str(cfg_out))
+                mlf.end_child()
+
+            # --- FREE GPU MEMORY BETWEEN CONFIGS ---
+            try:
+                del model, opt, sched, scaler
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+            except Exception:
+                pass
+
+    except KeyboardInterrupt:
+        if rank == 0:
+            print("\n[interrupt] saving partial results...", flush=True)
+            write_csv_and_latex(rows, out_dir, fname='results')
+    finally:
+        if rank == 0:
+            # final artifacts
+            try:
+                mlf.log_artifacts(str(out_dir))
+            except Exception:
+                pass
+            mlf.end()
+        if args.ddp and world_size > 1:
+            torch.distributed.destroy_process_group()
+
+
+if __name__ == '__main__':
+    main()

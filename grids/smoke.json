@@ -1,0 +1,5 @@
+[
+  { "gate": "none", "K": 0,   "topk": null, "d_g_mode": "width",  "tau": 10.0, "assign_once": true, "share_codebook": false },
+  { "gate": "vq",   "K": 512, "topk": null, "d_g_mode": "width",  "tau": 20.0, "assign_once": true, "share_codebook": false },
+  { "gate": "soft", "K": 512, "topk": 4,    "d_g_mode": "width",  "tau": 10.0, "assign_once": true, "share_codebook": false }
+]
