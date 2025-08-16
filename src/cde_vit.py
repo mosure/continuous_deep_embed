@@ -303,25 +303,47 @@ def attach_gates(
     # optional shared E across depth (shape depends on d_g_mode)
     E_shared: Optional[nn.Parameter] = None
     if share_E_across_depth:
-        d_g_example = d_in if d_g_mode == 'width' else _infer_hidden_dim_from_mlp(vit.blocks[0].mlp, fallback=4 * d_in)
+        d_g_example = d_in if d_g_mode == 'width' else _infer_hidden_dim_from_mlp(
+            vit.blocks[0].mlp, fallback=4 * d_in
+        )
         E_shared = nn.Parameter(torch.zeros(K, d_g_example))
         vit.register_parameter('deepembed_E', E_shared)
 
+    # gentle guardrail: VQ ignores topk; warn once if user set it
+    _warned_vq_topk = False
+
     for li, blk in enumerate(vit.blocks):
-        # before wrapping: read hidden dim from original mlp
+        # read hidden dim from original mlp (before wrapping)
         d_ff = _infer_hidden_dim_from_mlp(blk.mlp, fallback=4 * d_in)
         d_g = d_ff if d_g_mode == 'expand' else d_in
 
-        # choose per-block or shared params
+        # choose per-block or shared codebook
         cb_param = codebook_shared
         if cb_param is None:  # per-layer codebook
             cb_param = nn.Parameter(torch.randn(K, d_in) / math.sqrt(d_in))
-            setattr(blk, f'deepembed_codebook_{li:02d}', cb_param)  # register under block for clarity
+            setattr(blk, f'deepembed_codebook_{li:02d}', cb_param)  # register under block
 
-        gate_cls = SoftCodebookGate if kind == 'soft' else VQGate
-        gate = gate_cls(K, d_in, d_g, tau=(tau if kind == 'soft' else max(12.0, tau)),
-                        topk=(topk if kind == 'soft' else 1),
-                        share_codebook=cb_param, share_E=E_shared)
+        if kind == 'soft':
+            # Only Soft gate takes 'topk'
+            gate = SoftCodebookGate(
+                K, d_in, d_g,
+                tau=tau,
+                topk=topk if (topk is not None) else K,
+                share_codebook=cb_param,
+                share_E=E_shared
+            )
+        elif kind == 'vq':
+            if (topk is not None) and not _warned_vq_topk:
+                print("[CDE] Warning: 'topk' is ignored for VQ; using hard 1-of-K.", flush=True)
+                _warned_vq_topk = True
+            gate = VQGate(
+                K, d_in, d_g,
+                tau=max(12.0, tau),
+                share_codebook=cb_param,
+                share_E=E_shared
+            )
+        else:
+            continue  # no gate
 
         if d_g_mode == 'expand':
             blk.mlp = MlpWithGateExpand(blk.mlp, gate)

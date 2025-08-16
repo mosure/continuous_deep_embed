@@ -1,6 +1,4 @@
 [
-  { "gate": "none", "K": 0, "topk": null, "d_g_mode": "width",  "tau": 10.0, "assign_once": true, "share_codebook": true },
-
   { "gate": "vq", "K": 128,  "topk": null, "d_g_mode": "width",  "tau": 20.0, "assign_once": true, "share_codebook": true },
   { "gate": "vq", "K": 128,  "topk": null, "d_g_mode": "expand", "tau": 20.0, "assign_once": true, "share_codebook": true },
   { "gate": "vq", "K": 256,  "topk": null, "d_g_mode": "width",  "tau": 20.0, "assign_once": true, "share_codebook": true },
