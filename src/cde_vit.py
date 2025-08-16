@@ -5,6 +5,7 @@
 # - MLflow logging (grid parent + per‑config nested runs)
 # - Robust training: TF32, channels_last, grad accumulation, warmup‑cosine
 # - Windows-friendly DataLoader defaults; suppresses noisy third‑party logs
+# - NEW: Kaggle CLS-LOC layout support (--imagenet_layout cls-loc)
 
 # --- tame noisy third-party import logs (OpenVINO, HF telemetry) ---
 import os, warnings
@@ -29,8 +30,10 @@ from typing import List, Optional, Tuple, Dict, Any
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import DataLoader
+from torch.utils.data import Dataset, DataLoader
 from torchvision import datasets, transforms
+from PIL import Image
+import xml.etree.ElementTree as ET
 
 # Optional deps (degrade gracefully)
 try:
@@ -85,29 +88,64 @@ def ensure_dir(p: Path):
     p.mkdir(parents=True, exist_ok=True)
 
 
-def assert_imagenet_root(root: str):
-    train = Path(root) / "train"
-    val   = Path(root) / "val"
-    if not train.is_dir() or not val.is_dir():
-        raise FileNotFoundError(
-            f"--imagenet must point to a folder that has 'train' and 'val'. Got: {root}"
-        )
+# ----------- dataset root assertions & helpers (NEW for cls-loc) ----------
+
+def _resolve_ilsvrc_root(root: Path) -> Path:
+    """
+    Accepts:
+      - <base> that contains 'ILSVRC/'
+      - 'ILSVRC/' itself
+      - '.../ILSVRC/Data/CLS-LOC' (will walk up)
+    Returns the 'ILSVRC/' directory.
+    """
+    p = Path(root)
+    # Case 1: base contains ILSVRC
+    if (p / "ILSVRC" / "Data" / "CLS-LOC").is_dir():
+        return p / "ILSVRC"
+    # Case 2: p is ILSVRC
+    if (p / "Data" / "CLS-LOC").is_dir() and p.name == "ILSVRC":
+        return p
+    # Case 3: p ends with .../Data/CLS-LOC
+    if p.name == "CLS-LOC" and p.parent.name == "Data" and p.parent.parent.name == "ILSVRC":
+        return p.parent.parent
+    # Case 4: allow passing .../ILSVRC directly but without Data/CLS-LOC populated yet
+    if p.name == "ILSVRC" and (p / "Data" / "CLS-LOC").exists():
+        return p
+    raise FileNotFoundError(
+        f"Could not locate ILSVRC root from '{root}'. "
+        "Expected one of: <base>/ILSVRC, <base>/ILSVRC/Data/CLS-LOC, or the ILSVRC directory itself."
+    )
 
 
-def cfg_hash(cfg: "ExpCfg") -> str:
-    s = json.dumps(asdict(cfg), sort_keys=True)
-    return hashlib.sha1(s.encode("utf-8")).hexdigest()[:8]
-
-
-def cfg_slug(cfg: "ExpCfg") -> str:
-    topk = cfg.topk if cfg.topk is not None else "n"
-    cb = "cbS" if getattr(cfg, "share_codebook", True) else "cbL"
-    e  = "eS" if getattr(cfg, "share_E", False) else "eL"
-    return f"{cfg.gate}-K{cfg.K}-k{topk}-{cfg.d_g_mode}-t{cfg.tau:g}-{cb}-{e}"
-
-
-def cfg_dir(base: Path, idx: int, cfg: "ExpCfg") -> Path:
-    return base / f"{idx:02d}_{cfg_slug(cfg)}_{cfg_hash(cfg)}"
+def assert_imagenet_root(root: str, layout: str = "folder"):
+    if layout == "folder":
+        train = Path(root) / "train"
+        val = Path(root) / "val"
+        if not train.is_dir() or not val.is_dir():
+            raise FileNotFoundError(
+                f"--imagenet must point to a folder with 'train' and 'val'. Got: {root}"
+            )
+        # quick sanity: at least one class folder in each
+        if not any(train.iterdir()):
+            raise FileNotFoundError(f"No class folders found in {train}")
+        if not any(val.iterdir()):
+            raise FileNotFoundError(f"No class folders found in {val}")
+    elif layout == "cls-loc":
+        ils = _resolve_ilsvrc_root(Path(root))
+        data_train = ils / "Data" / "CLS-LOC" / "train"
+        data_val = ils / "Data" / "CLS-LOC" / "val"
+        ann_train = ils / "Annotations" / "CLS-LOC" / "train"
+        ann_val = ils / "Annotations" / "CLS-LOC" / "val"
+        if not data_train.is_dir():
+            raise FileNotFoundError(f"Missing train images dir: {data_train}")
+        if not ann_train.is_dir():
+            warnings.warn(f"Missing train annotations dir (not required for classification): {ann_train}")
+        if not data_val.is_dir():
+            raise FileNotFoundError(f"Missing val images dir: {data_val}")
+        if not ann_val.is_dir():
+            raise FileNotFoundError(f"Missing val annotations dir (required to infer labels): {ann_val}")
+    else:
+        raise ValueError(f"Unknown layout '{layout}' (choices: 'folder', 'cls-loc').")
 
 
 # ----------------------- model: gates ------------------------------------
@@ -364,6 +402,90 @@ IMAGENET_MEAN = [0.485, 0.456, 0.406]
 IMAGENET_STD  = [0.229, 0.224, 0.225]
 
 
+class ImageNetClsLoc(Dataset):
+    """
+    ImageNet classification dataset over the Kaggle ILSVRC CLS-LOC layout.
+
+    Train:
+      <root>/ILSVRC/Data/CLS-LOC/train/<wnid>/*.JPEG   (folders define classes)
+
+    Val:
+      <root>/ILSVRC/Data/CLS-LOC/val/*.JPEG            (flat)
+      <root>/ILSVRC/Annotations/CLS-LOC/val/<stem>.xml (labels: first object/name -> wnid)
+    """
+    IMG_EXTS = {".jpeg", ".jpg", ".JPEG", ".JPG"}
+
+    def __init__(self, root: str, split: str, transform=None):
+        super().__init__()
+        self.transform = transform
+        self.split = split.lower()
+        ils = _resolve_ilsvrc_root(Path(root))
+
+        self.data_dir = ils / "Data" / "CLS-LOC" / self.split
+        self.ann_dir  = ils / "Annotations" / "CLS-LOC" / self.split
+
+        if self.split == "train":
+            # classes from folders
+            class_dirs = [p for p in self.data_dir.iterdir() if p.is_dir()]
+            self.classes = sorted([p.name for p in class_dirs])
+            self.class_to_idx = {c: i for i, c in enumerate(self.classes)}
+            samples: List[Tuple[str, int]] = []
+            for cdir in class_dirs:
+                idx = self.class_to_idx[cdir.name]
+                for imgp in cdir.iterdir():
+                    if imgp.suffix in self.IMG_EXTS:
+                        samples.append((str(imgp), idx))
+            self.samples = samples
+        elif self.split == "val":
+            # classes derived from TRAIN (stable ordering)
+            train_dir = ils / "Data" / "CLS-LOC" / "train"
+            class_dirs = [p for p in train_dir.iterdir() if p.is_dir()]
+            self.classes = sorted([p.name for p in class_dirs])
+            self.class_to_idx = {c: i for i, c in enumerate(self.classes)}
+            # enumerate flat images, map via XML -> wnid
+            imgs = sorted([p for p in self.data_dir.iterdir() if p.suffix in self.IMG_EXTS])
+            samples = []
+            miss_xml = 0
+            miss_wnid = 0
+            for i, imgp in enumerate(imgs, 1):
+                stem = imgp.stem  # e.g., ILSVRC2012_val_00000001
+                xmlp = self.ann_dir / f"{stem}.xml"
+                if not xmlp.is_file():
+                    miss_xml += 1
+                    continue
+                wnid = None
+                try:
+                    root_xml = ET.parse(str(xmlp)).getroot()
+                    obj = root_xml.find("object")
+                    if obj is not None:
+                        wnid = obj.findtext("name")
+                except Exception:
+                    wnid = None
+                if wnid is None or wnid not in self.class_to_idx:
+                    miss_wnid += 1
+                    continue
+                samples.append((str(imgp), self.class_to_idx[wnid]))
+            if (miss_xml + miss_wnid) > 0:
+                print(f"[cls-loc:val] skipped images: missing_xml={miss_xml}, missing_or_unknown_wnid={miss_wnid}", flush=True)
+            self.samples = samples
+        else:
+            raise ValueError("split must be 'train' or 'val'")
+
+        if len(self.samples) == 0:
+            raise RuntimeError(f"No samples found for split='{self.split}' in {self.data_dir}")
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, index: int):
+        path, target = self.samples[index]
+        with Image.open(path) as im:
+            im = im.convert("RGB")
+        if self.transform is not None:
+            im = self.transform(im)
+        return im, target
+
+
 def make_imagenet_loaders(
     root: str,
     bs: int,
@@ -372,6 +494,7 @@ def make_imagenet_loaders(
     ddp: bool = False,
     rank: int = 0,
     world_size: int = 1,
+    layout: str = "folder",  # NEW
 ):
     """Create loaders; on Windows, default to workers=0 to avoid spawn spam unless user overrides."""
     if workers is None:
@@ -391,11 +514,18 @@ def make_imagenet_loaders(
         transforms.ToTensor(),
         transforms.Normalize(IMAGENET_MEAN, IMAGENET_STD),
     ])
-    train_ds = datasets.ImageFolder(os.path.join(root, 'train'), train_tf)
-    val_ds   = datasets.ImageFolder(os.path.join(root, 'val'),   val_tf)
+
+    if layout == "folder":
+        train_ds = datasets.ImageFolder(os.path.join(root, 'train'), train_tf)
+        val_ds   = datasets.ImageFolder(os.path.join(root, 'val'),   val_tf)
+    elif layout == "cls-loc":
+        train_ds = ImageNetClsLoc(root, split="train", transform=train_tf)
+        val_ds   = ImageNetClsLoc(root, split="val",   transform=val_tf)
+    else:
+        raise ValueError(f"Unknown layout '{layout}'")
 
     if rank == 0:
-        print(f"[data] {root} -> train={len(train_ds)}  val={len(val_ds)}  classes={len(train_ds.classes)}", flush=True)
+        print(f"[data:{layout}] root={root} -> train={len(train_ds)}  val={len(val_ds)}  classes={len(getattr(train_ds,'classes',[])) or len(train_ds.classes)}", flush=True)
 
     train_sampler = None
     val_sampler = None
@@ -417,7 +547,15 @@ def make_imagenet_loaders(
         sampler=val_sampler, num_workers=workers, pin_memory=pin,
         persistent_workers=persistent
     )
-    return train_loader, val_loader, len(train_ds.classes)
+
+    # number of classes
+    if hasattr(train_ds, "classes"):
+        n_classes = len(train_ds.classes)
+    else:
+        # torchvision ImageFolder
+        n_classes = len(train_ds.classes)
+
+    return train_loader, val_loader, n_classes
 
 
 # ----------------------- training utils ----------------------------------
@@ -575,6 +713,22 @@ def build_model(cfg: ExpCfg, num_classes: int = 1000) -> nn.Module:
     return model
 
 
+def cfg_hash(cfg: "ExpCfg") -> str:
+    s = json.dumps(asdict(cfg), sort_keys=True)
+    return hashlib.sha1(s.encode("utf-8")).hexdigest()[:8]
+
+
+def cfg_slug(cfg: "ExpCfg") -> str:
+    topk = cfg.topk if cfg.topk is not None else "n"
+    cb = "cbS" if getattr(cfg, "share_codebook", True) else "cbL"
+    e  = "eS" if getattr(cfg, "share_E", False) else "eL"
+    return f"{cfg.gate}-K{cfg.K}-k{topk}-{cfg.d_g_mode}-t{cfg.tau:g}-{cb}-{e}"
+
+
+def cfg_dir(base: Path, idx: int, cfg: "ExpCfg") -> Path:
+    return base / f"{idx:02d}_{cfg_slug(cfg)}_{cfg_hash(cfg)}"
+
+
 def exp_row_dict(cfg: ExpCfg, budget: Budget, acc1: Optional[float], epochs: int,
                  cfg_rel_dir: str, last_rel: Optional[str], best_rel: Optional[str]) -> dict:
     return {
@@ -690,7 +844,11 @@ def write_csv_and_latex(rows: List[dict], out_dir: Path, fname: str = 'results')
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--imagenet', type=str, required=True,
-                    help='path to ImageNet/Imagenette root with train/ and val/')
+                    help='root for ImageNet. '
+                         "If --imagenet_layout=folder, it must contain 'train/' and 'val/'. "
+                         "If --imagenet_layout=cls-loc, it may be the parent containing 'ILSVRC/', the 'ILSVRC/' folder, or even '.../ILSVRC/Data/CLS-LOC'.")
+    ap.add_argument('--imagenet_layout', type=str, default='folder', choices=['folder','cls-loc'],
+                    help="Directory layout of the dataset root (default: folder).")
     ap.add_argument('--grid', type=str, default='default',
                     help="grid: 'default' | 'smoke' | path to JSON")
     ap.add_argument('--epochs', type=int, default=100)
@@ -752,7 +910,7 @@ def main():
             json.dump(vars(args), f, indent=2)
 
     # dataset sanity
-    assert_imagenet_root(args.imagenet)
+    assert_imagenet_root(args.imagenet, layout=args.imagenet_layout)
 
     # grid
     grid = load_grid(args.grid)
@@ -761,14 +919,15 @@ def main():
     run_name = args.mlflow_run or f"{Path(__file__).stem}-{now_utc()}"
     mlf = MLflowLogger(args.mlflow and (rank == 0), args.mlflow_exp, run_name,
                        tags={"host": os.uname().nodename if hasattr(os, "uname") else "win",
-                             "grid": args.grid})
+                             "grid": args.grid,
+                             "imagenet_layout": args.imagenet_layout})
 
     rows: List[dict] = []
     try:
         # data
         train_loader, val_loader, num_classes = make_imagenet_loaders(
             args.imagenet, args.bs, workers=args.workers, size=224,
-            ddp=ddp_active, rank=rank, world_size=world_size
+            ddp=ddp_active, rank=rank, world_size=world_size, layout=args.imagenet_layout
         )
 
         if rank == 0:
