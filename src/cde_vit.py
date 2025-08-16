@@ -1047,7 +1047,7 @@ def main():
                     for i, (x, y) in enumerate(train_loader):
                         x = x.to(device, non_blocking=True).to(memory_format=torch.channels_last)
                         y = y.to(device, non_blocking=True)
-                        with torch.cuda.amp.autocast(enabled=(not args.no_amp)):
+                        with torch.amp.autocast(device_type='cuda', enabled=(not args.no_amp)):
                             logits = model(x)
                             loss = ce(logits, y) / accum
                         scaler.scale(loss).backward()
