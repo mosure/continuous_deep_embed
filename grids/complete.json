@@ -1,4 +1,3 @@
 [
-  { "gate": "none", "K": 0, "topk": null, "d_g_mode": "width",  "tau": 10.0, "assign_once": true, "share_codebook": true },
 
 ]

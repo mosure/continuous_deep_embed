@@ -875,13 +875,13 @@ try:
     def set_sdpa_backend(pref: str):
         # Map CLI choices to backend preference tuples
         if pref == 'flash':
-            backends = (_SDPBackend.FLASH_ATTENTION, _SDPBackend.EFFICIENT_ATTENTION)
+            backends = [_SDPBackend.FLASH_ATTENTION, _SDPBackend.EFFICIENT_ATTENTION]
         elif pref == 'mem_efficient':
-            backends = (_SDPBackend.EFFICIENT_ATTENTION,)
+            backends = [_SDPBackend.EFFICIENT_ATTENTION,]
         elif pref == 'math':
-            backends = (_SDPBackend.MATH,)
+            backends = [_SDPBackend.MATH,]
         else:  # auto
-            backends = (_SDPBackend.FLASH_ATTENTION, _SDPBackend.EFFICIENT_ATTENTION, _SDPBackend.MATH)
+            backends = [_SDPBackend.FLASH_ATTENTION, _SDPBackend.EFFICIENT_ATTENTION, _SDPBackend.MATH]
 
         @contextmanager
         def _ctx():
