@@ -5,7 +5,9 @@
 # - MLflow logging (grid parent + per‑config nested runs)
 # - Robust training: TF32, channels_last, grad accumulation, warmup‑cosine
 # - Windows-friendly DataLoader defaults; suppresses noisy third‑party logs
-# - NEW: Kaggle CLS-LOC layout support (--imagenet_layout cls-loc)
+# - Kaggle CLS-LOC layout support (--imagenet_layout cls-loc)
+# - Performance flags: bf16/fp16 autocast, fused AdamW, Flash SDPA, torch.compile,
+#   DataLoader prefetch/drop_last
 
 # --- tame noisy third-party import logs (OpenVINO, HF telemetry) ---
 import os, warnings
@@ -34,6 +36,7 @@ from torch.utils.data import Dataset, DataLoader
 from torchvision import datasets, transforms
 from PIL import Image
 import xml.etree.ElementTree as ET
+from contextlib import contextmanager  # NEW
 
 # Optional deps (degrade gracefully)
 try:
@@ -74,7 +77,7 @@ def set_seed(seed: int, deterministic: bool = False):
         os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
     else:
         torch.backends.cudnn.benchmark = True
-    # TF32 for Ampere+ (faster matmul/conv with minimal accuracy impact)
+    # TF32 for Ampere+/Hopper (faster matmul/conv with minimal accuracy impact)
     if torch.cuda.is_available():
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
@@ -88,7 +91,7 @@ def ensure_dir(p: Path):
     p.mkdir(parents=True, exist_ok=True)
 
 
-# ----------- dataset root assertions & helpers (NEW for cls-loc) ----------
+# ----------- dataset root assertions & helpers (for cls-loc) ----------
 
 def _resolve_ilsvrc_root(root: Path) -> Path:
     """
@@ -516,7 +519,9 @@ def make_imagenet_loaders(
     ddp: bool = False,
     rank: int = 0,
     world_size: int = 1,
-    layout: str = "folder",  # NEW
+    layout: str = "folder",   # existing
+    prefetch: int = 6,        # NEW
+    drop_last: bool = False,  # NEW
 ):
     """Create loaders; on Windows, default to workers=0 to avoid spawn spam unless user overrides."""
     if workers is None:
@@ -547,7 +552,8 @@ def make_imagenet_loaders(
         raise ValueError(f"Unknown layout '{layout}'")
 
     if rank == 0:
-        print(f"[data:{layout}] root={root} -> train={len(train_ds)}  val={len(val_ds)}  classes={len(getattr(train_ds,'classes',[])) or len(train_ds.classes)}", flush=True)
+        n_classes = len(getattr(train_ds, 'classes', [])) or (len(train_ds.classes) if hasattr(train_ds, 'classes') else 0)
+        print(f"[data:{layout}] root={root} -> train={len(train_ds)}  val={len(val_ds)}  classes={n_classes}", flush=True)
 
     train_sampler = None
     val_sampler = None
@@ -559,24 +565,22 @@ def make_imagenet_loaders(
     pin = torch.cuda.is_available()
     persistent = workers > 0
 
+    # Note: prefetch_factor is used only when workers > 0.
     train_loader = DataLoader(
         train_ds, batch_size=bs, shuffle=(train_sampler is None),
         sampler=train_sampler, num_workers=workers, pin_memory=pin,
-        persistent_workers=persistent
+        persistent_workers=persistent, prefetch_factor=prefetch,
+        pin_memory_device=("cuda" if pin else ""), drop_last=drop_last
     )
     val_loader = DataLoader(
         val_ds, batch_size=bs, shuffle=False,
         sampler=val_sampler, num_workers=workers, pin_memory=pin,
-        persistent_workers=persistent
+        persistent_workers=persistent, prefetch_factor=prefetch,
+        pin_memory_device=("cuda" if pin else "")
     )
 
     # number of classes
-    if hasattr(train_ds, "classes"):
-        n_classes = len(train_ds.classes)
-    else:
-        # torchvision ImageFolder
-        n_classes = len(train_ds.classes)
-
+    n_classes = len(train_ds.classes) if hasattr(train_ds, "classes") else 1000
     return train_loader, val_loader, n_classes
 
 
@@ -716,7 +720,7 @@ class ExpCfg:
     d_g_mode: str        # 'width' | 'expand'
     tau: float           # temperature
     assign_once: bool    # for est flops only
-    # NEW: depth sharing toggles
+    # depth sharing toggles
     share_codebook: bool = True  # True: one codebook across depth; False: per-layer codebook
     share_E: bool = False        # True: one E across depth; False: per-layer E (default)
 
@@ -811,7 +815,7 @@ def load_grid(arg: str) -> List[ExpCfg]:
         if g.get("topk") in (0, "0"):
             g["topk"] = None
         g.setdefault("assign_once", True)
-        # NEW: sharing defaults + aliases
+        # sharing defaults + aliases
         # aliases: codebook_per_layer / cb_per_layer -> share_codebook = not(...)
         if "share_codebook" not in g:
             per_layer_alias = g.pop("codebook_per_layer", None)
@@ -861,6 +865,69 @@ def write_csv_and_latex(rows: List[dict], out_dir: Path, fname: str = 'results')
     print(f'wrote {tex_path}')
 
 
+# ----------------------- SDPA backend compat shim ------------------------
+
+# Prefer new torch.nn.attention.sdpa_kernel; fallback to legacy torch.backends.cuda.sdp_kernel
+try:
+    from torch.nn.attention import sdpa_kernel as _sdpa_kernel_new
+    from torch.nn.attention import SDPBackend as _SDPBackend
+
+    def set_sdpa_backend(pref: str):
+        # Map CLI choices to backend preference tuples
+        if pref == 'flash':
+            backends = (_SDPBackend.FLASH_ATTENTION, _SDPBackend.EFFICIENT_ATTENTION)
+        elif pref == 'mem_efficient':
+            backends = (_SDPBackend.EFFICIENT_ATTENTION,)
+        elif pref == 'math':
+            backends = (_SDPBackend.MATH,)
+        else:  # auto
+            backends = (_SDPBackend.FLASH_ATTENTION, _SDPBackend.EFFICIENT_ATTENTION, _SDPBackend.MATH)
+
+        @contextmanager
+        def _ctx():
+            # New API accepts an iterable of backends
+            with _sdpa_kernel_new(backends):
+                yield
+        return _ctx()
+
+except Exception:
+    # Legacy API
+    try:
+        from torch.backends.cuda import sdp_kernel as _sdpa_kernel_legacy
+
+        def set_sdpa_backend(pref: str):
+            if pref == 'flash':
+                kw = dict(enable_flash=True,  enable_mem_efficient=True,  enable_math=False)
+            elif pref == 'mem_efficient':
+                kw = dict(enable_flash=False, enable_mem_efficient=True,  enable_math=False)
+            elif pref == 'math':
+                kw = dict(enable_flash=False, enable_mem_efficient=False, enable_math=True)
+            else:  # auto
+                kw = dict(enable_flash=True,  enable_mem_efficient=True,  enable_math=True)
+
+            @contextmanager
+            def _ctx():
+                with _sdpa_kernel_legacy(**kw):
+                    yield
+            return _ctx()
+    except Exception:
+        # No-op shim
+        def set_sdpa_backend(pref: str):
+            @contextmanager
+            def _ctx():
+                yield
+            return _ctx()
+
+
+# ----------------------- dtype helper ------------------------------------
+
+def _dtype_from_str(name: str):
+    name = name.lower()
+    if name == 'bf16': return torch.bfloat16
+    if name == 'fp16': return torch.float16
+    return torch.float32
+
+
 # ----------------------- main --------------------------------------------
 
 def main():
@@ -879,11 +946,20 @@ def main():
     ap.add_argument('--accum', type=int, default=1, help='gradient accumulation steps')
     ap.add_argument('--workers', type=int, default=None,
                     help='num dataloader workers (default: 0 on Windows, 8 otherwise)')
+    ap.add_argument('--prefetch', type=int, default=6,
+                    help='DataLoader prefetch_factor')
+    ap.add_argument('--drop_last', action='store_true',
+                    help='drop last batch in train loader')
+    ap.add_argument('--val_every', type=int, default=1,
+                    help='validate every N epochs (1 = every epoch)')
     ap.add_argument('--lr', type=float, default=5e-4)
     ap.add_argument('--wd', type=float, default=0.05)
     ap.add_argument('--clip', type=float, default=1.0, help='grad-norm clip (0 disables)')
     ap.add_argument('--label_smoothing', type=float, default=0.0)
     ap.add_argument('--no_amp', action='store_true')
+    ap.add_argument('--amp_dtype', type=str, default='bf16',
+                    choices=['bf16', 'fp16', 'fp32'],
+                    help='autocast dtype (Hopper: bf16 is recommended)')
     ap.add_argument('--assign_once', action='store_true',
                     help='compute est flops with assignment once (budgets only)')
     ap.add_argument('--device', type=str, default='cuda')
@@ -906,6 +982,15 @@ def main():
     ap.add_argument('--mlflow', action='store_true', help='enable MLflow logging if installed')
     ap.add_argument('--mlflow_exp', type=str, default='CDE-ViT')
     ap.add_argument('--mlflow_run', type=str, default=None)
+    # Performance toggles
+    ap.add_argument('--fused_adamw', action='store_true',
+                    help='use fused AdamW (PyTorch 2.x, CUDA only)')
+    ap.add_argument('--compile_mode', type=str, default='none',
+                    choices=['none', 'reduce-overhead', 'max-autotune'],
+                    help='torch.compile mode')
+    ap.add_argument('--sdp', type=str, default='flash',
+                    choices=['auto', 'flash', 'mem_efficient', 'math'],
+                    help='Scaled-Dot-Product-Attention backend preference')
     args = ap.parse_args()
 
     # rank/world detection
@@ -945,199 +1030,247 @@ def main():
                              "imagenet_layout": args.imagenet_layout})
 
     rows: List[dict] = []
+
+    # ---- SDPA backend context (new API or legacy fallback) ----
+    backend_ctx = set_sdpa_backend(args.sdp)
+
     try:
-        # data
-        train_loader, val_loader, num_classes = make_imagenet_loaders(
-            args.imagenet, args.bs, workers=args.workers, size=224,
-            ddp=ddp_active, rank=rank, world_size=world_size, layout=args.imagenet_layout
-        )
-
-        if rank == 0:
-            mlf.log_params({
-                "epochs": args.epochs, "warmup": args.warmup,
-                "bs": args.bs, "accum": args.accum, "workers": (0 if args.workers is None and os.name=="nt" else (args.workers or 8)),
-                "lr": args.lr, "wd": args.wd, "clip": args.clip, "label_smoothing": args.label_smoothing,
-                "amp": (not args.no_amp), "assign_once": args.assign_once, "num_classes": num_classes,
-                "ddp": ddp_active, "world_size": world_size
-            })
-
-        # loss
-        ce = nn.CrossEntropyLoss(label_smoothing=args.label_smoothing).to(device)
-
-        for j, cfg in enumerate(grid):
-            cfg_out = cfg_dir(out_dir, j, cfg)
-            if rank == 0:
-                ensure_dir(cfg_out)
-                # persist cfg/budget placeholders early
-                with open(cfg_out / "cfg.json", "w") as f: json.dump(asdict(cfg), f, indent=2)
+        with backend_ctx:
+            # data
+            train_loader, val_loader, num_classes = make_imagenet_loaders(
+                args.imagenet, args.bs, workers=args.workers, size=224,
+                ddp=ddp_active, rank=rank, world_size=world_size,
+                layout=args.imagenet_layout, prefetch=args.prefetch,
+                drop_last=args.drop_last
+            )
 
             if rank == 0:
-                print(f'\n== experiment {j+1}/{len(grid)}: {cfg} => {cfg_out.name}\n', flush=True)
-
-            # nested MLflow run per-config
-            if rank == 0:
-                mlf.child(run_name=f"{j:02d}_{cfg_slug(cfg)}")
-
-            # model
-            model = build_model(cfg, num_classes=num_classes)
-            model.to(device)
-            if torch.cuda.is_available():
-                model.to(memory_format=torch.channels_last)
-            if ddp_active:
-                from torch.nn.parallel import DistributedDataParallel as DDP
-                model = DDP(model, device_ids=[rank % max(1, torch.cuda.device_count())],
-                            output_device=rank % max(1, torch.cuda.device_count()),
-                            broadcast_buffers=False)
-
-            # budget (note: assign_once only valid when codebook is shared)
-            budget = compute_budget(model.module if ddp_active else model,
-                                    cfg.gate, cfg.K, cfg.topk, cfg.d_g_mode,
-                                    cfg.assign_once, share_codebook=cfg.share_codebook)
-            if rank == 0:
-                print(f'params(M)={budget.params_m:.3f}  '
-                      f'est_total_GFLOPs={budget.est_gflops_total:.3f}  '
-                      f'overhead={budget.est_gflops_overhead:.3f}', flush=True)
-                with open(cfg_out / "budget.json", "w") as f: json.dump(asdict(budget), f, indent=2)
                 mlf.log_params({
-                    "cfg_gate": cfg.gate, "cfg_K": cfg.K, "cfg_topk": cfg.topk,
-                    "cfg_d_g_mode": cfg.d_g_mode, "cfg_tau": cfg.tau, "cfg_assign_once": cfg.assign_once,
-                    "cfg_cb_shared": cfg.share_codebook, "cfg_E_shared": cfg.share_E,
-                    "params_M": round(budget.params_m, 3),
-                    "GFLOPs_total": round(budget.est_gflops_total, 3),
-                    "GFLOPs_overhead": round(budget.est_gflops_overhead, 3),
+                    "epochs": args.epochs, "warmup": args.warmup,
+                    "bs": args.bs, "accum": args.accum, "workers": (0 if args.workers is None and os.name=="nt" else (args.workers or 8)),
+                    "lr": args.lr, "wd": args.wd, "clip": args.clip, "label_smoothing": args.label_smoothing,
+                    "amp": (not args.no_amp), "amp_dtype": args.amp_dtype,
+                    "assign_once": args.assign_once, "num_classes": num_classes,
+                    "ddp": ddp_active, "world_size": world_size,
+                    "prefetch": args.prefetch, "drop_last": args.drop_last,
+                    "compile_mode": args.compile_mode, "sdp": args.sdp, "fused_adamw": args.fused_adamw,
+                    "val_every": args.val_every
                 })
 
-            # optim/sched/amp
-            param_groups = build_param_groups(model, args.wd)
-            opt = torch.optim.AdamW(param_groups, lr=args.lr, betas=(0.9, 0.999))
-            sched = WarmupCosine(opt, warmup_epochs=args.warmup, max_epochs=args.epochs)
-            scaler = torch.cuda.amp.GradScaler(enabled=(not args.no_amp))
+            # loss
+            ce = nn.CrossEntropyLoss(label_smoothing=args.label_smoothing).to(device)
 
-            # resume?
-            start_epoch = 0
-            best_acc1 = float("-inf")
-            if args.resume:
-                start_epoch, best_acc1 = load_checkpoint(args.resume, model, opt, sched, scaler)
-            elif args.resume_auto:
-                auto = cfg_out / "ckpt_last.pt"
-                if auto.is_file():
-                    start_epoch, best_acc1 = load_checkpoint(str(auto), model, opt, sched, scaler)
-
-            # training
-            acc1 = None
-            last_rel = None
-            best_rel = None
-
-            if not args.skip_train:
-                for ep in range(start_epoch, args.epochs):
-                    if ddp_active and hasattr(train_loader.sampler, "set_epoch"):
-                        train_loader.sampler.set_epoch(ep)
-
-                    model.train()
-                    t0 = time.time()
-                    if torch.cuda.is_available():
-                        torch.cuda.reset_peak_memory_stats(device)
-
-                    tot_loss = 0.0
-                    seen = 0
-                    steps = len(train_loader)
-                    accum = max(1, args.accum)
-                    opt.zero_grad(set_to_none=True)
-
-                    for i, (x, y) in enumerate(train_loader):
-                        x = x.to(device, non_blocking=True).to(memory_format=torch.channels_last)
-                        y = y.to(device, non_blocking=True)
-                        with torch.amp.autocast(device_type='cuda', enabled=(not args.no_amp)):
-                            logits = model(x)
-                            loss = ce(logits, y) / accum
-                        scaler.scale(loss).backward()
-
-                        if (i + 1) % accum == 0 or (i + 1) == steps:
-                            if args.clip and args.clip > 0:
-                                scaler.unscale_(opt)
-                                nn.utils.clip_grad_norm_(model.parameters(), args.clip)
-                            scaler.step(opt)
-                            scaler.update()
-                            opt.zero_grad(set_to_none=True)
-
-                        tot_loss += loss.item() * accum * x.size(0)
-                        seen += x.size(0)
-
-                        # progress (rank 0)
-                        if rank == 0 and (i + 1) % max(1, steps // 10) == 0:
-                            print(f'ep {ep+1}/{args.epochs} it {i+1}/{steps} '
-                                  f'loss {tot_loss/max(1,seen):.4f}', flush=True)
-
-                    sched.step()
-                    dt = time.time() - t0
-                    imgs_per_s = seen / max(1e-6, dt)
-                    acc1 = evaluate_top1(model, val_loader, device)
-
-                    if rank == 0:
-                        max_mem = torch.cuda.max_memory_allocated(device) if torch.cuda.is_available() else 0
-                        print(f'epoch {ep+1}/{args.epochs} acc1={acc1:.2f}% '
-                              f'loss={tot_loss/max(1,seen):.4f} '
-                              f'time={dt:.1f}s ({imgs_per_s:.1f} img/s) '
-                              f'gpu_mem={sizeof_fmt(max_mem)}', flush=True)
-                        mlf.log_metrics({
-                            "acc1": float(acc1),
-                            "loss": float(tot_loss/max(1,seen)),
-                            "imgs_per_s": float(imgs_per_s)
-                        }, step=ep+1)
-
-                        # checkpoints (per-config)
-                        is_save_epoch = ((ep + 1) % max(1, args.save_every) == 0) or (ep + 1 == args.epochs)
-                        if is_save_epoch:
-                            base_state = {
-                                "epoch": ep + 1,
-                                "best_acc1": max(best_acc1, acc1 if acc1 is not None else float("-inf")),
-                                "model": (model.module if hasattr(model, "module") else model).state_dict(),
-                                "opt": opt.state_dict(),
-                                "sched": sched.state_dict(),
-                                "scaler": scaler.state_dict(),
-                                "cfg": asdict(cfg),
-                                "args": vars(args)
-                            }
-                            last_path, new_best = save_checkpoint_pair(cfg_out, base_state, is_best=(acc1 >= best_acc1))
-                            last_rel = str(Path(last_path).relative_to(out_dir))
-                            if new_best:
-                                best_rel = str(Path(new_best).relative_to(out_dir))
-                                best_acc1 = acc1
-                            if args.keep_snapshots:
-                                snap = cfg_out / f"ckpt_e{ep+1:03d}_a{acc1:.2f}.pt"
-                                torch.save(base_state, snap)
-
-                # metrics.json per-config
+            for j, cfg in enumerate(grid):
+                cfg_out = cfg_dir(out_dir, j, cfg)
                 if rank == 0:
-                    with open(cfg_out / "metrics.json", "w") as f:
-                        json.dump({
-                            "acc1_last": acc1,
-                            "acc1_best": best_acc1 if best_acc1 != float("-inf") else None
-                        }, f, indent=2)
+                    ensure_dir(cfg_out)
+                    # persist cfg/budget placeholders early
+                    with open(cfg_out / "cfg.json", "w") as f: json.dump(asdict(cfg), f, indent=2)
 
-            # end of one config
-            if rank == 0:
-                # in case of skip_train, derive rel paths if any existing
-                if last_rel is None and (cfg_out / "ckpt_last.pt").is_file():
-                    last_rel = str((cfg_out / "ckpt_last.pt").relative_to(out_dir))
-                if best_rel is None and (cfg_out / "ckpt_best.pt").is_file():
-                    best_rel = str((cfg_out / "ckpt_best.pt").relative_to(out_dir))
+                if rank == 0:
+                    print(f'\n== experiment {j+1}/{len(grid)}: {cfg} => {cfg_out.name}\n', flush=True)
 
-                row = exp_row_dict(cfg, budget, acc1, args.epochs if not args.skip_train else 0,
-                                   str(cfg_out.relative_to(out_dir)), last_rel, best_rel)
-                rows.append(row)
-                write_csv_and_latex(rows, out_dir, fname='results')
-                # log artifacts (per-config dir)
-                mlf.log_artifacts(str(cfg_out))
-                mlf.end_child()
+                # nested MLflow run per-config
+                if rank == 0:
+                    mlf.child(run_name=f"{j:02d}_{cfg_slug(cfg)}")
 
-            # --- FREE GPU MEMORY BETWEEN CONFIGS ---
-            try:
-                del model, opt, sched, scaler
+                # model
+                model = build_model(cfg, num_classes=num_classes)
+                model.to(device)
                 if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-            except Exception:
-                pass
+                    model.to(memory_format=torch.channels_last)
+
+                # torch.compile (compile BEFORE DDP wrap)
+                if args.compile_mode != 'none':
+                    mode = 'reduce-overhead' if args.compile_mode == 'reduce-overhead' else 'max-autotune'
+                    try:
+                        model = torch.compile(model, mode=mode, fullgraph=False)
+                    except Exception as _e:
+                        if rank == 0:
+                            print(f"[warn] torch.compile failed: {_e}. Continuing without compile.", flush=True)
+
+                if ddp_active:
+                    from torch.nn.parallel import DistributedDataParallel as DDP
+                    model = DDP(model, device_ids=[rank % max(1, torch.cuda.device_count())],
+                                output_device=rank % max(1, torch.cuda.device_count()),
+                                broadcast_buffers=False)
+
+                # budget (note: assign_once only valid when codebook is shared)
+                budget = compute_budget(model.module if ddp_active else model,
+                                        cfg.gate, cfg.K, cfg.topk, cfg.d_g_mode,
+                                        cfg.assign_once, share_codebook=cfg.share_codebook)
+                if rank == 0:
+                    print(f'params(M)={budget.params_m:.3f}  '
+                          f'est_total_GFLOPs={budget.est_gflops_total:.3f}  '
+                          f'overhead={budget.est_gflops_overhead:.3f}', flush=True)
+                    with open(cfg_out / "budget.json", "w") as f: json.dump(asdict(budget), f, indent=2)
+                    mlf.log_params({
+                        "cfg_gate": cfg.gate, "cfg_K": cfg.K, "cfg_topk": cfg.topk,
+                        "cfg_d_g_mode": cfg.d_g_mode, "cfg_tau": cfg.tau, "cfg_assign_once": cfg.assign_once,
+                        "cfg_cb_shared": cfg.share_codebook, "cfg_E_shared": cfg.share_E,
+                        "params_M": round(budget.params_m, 3),
+                        "GFLOPs_total": round(budget.est_gflops_total, 3),
+                        "GFLOPs_overhead": round(budget.est_gflops_overhead, 3),
+                    })
+
+                # optim/sched/amp
+                param_groups = build_param_groups(model, args.wd)
+                opt = torch.optim.AdamW(
+                    param_groups, lr=args.lr, betas=(0.9, 0.999),
+                    fused=getattr(torch.optim.AdamW, 'fused', False) and args.fused_adamw
+                )
+                sched = WarmupCosine(opt, warmup_epochs=args.warmup, max_epochs=args.epochs)
+
+                amp_dtype = _dtype_from_str(args.amp_dtype)
+                use_fp16_scaler = (amp_dtype == torch.float16) and (not args.no_amp)
+                scaler = torch.cuda.amp.GradScaler(enabled=use_fp16_scaler)
+
+                # resume?
+                start_epoch = 0
+                best_acc1 = float("-inf")
+                if args.resume:
+                    start_epoch, best_acc1 = load_checkpoint(args.resume, model, opt, sched, scaler)
+                elif args.resume_auto:
+                    auto = cfg_out / "ckpt_last.pt"
+                    if auto.is_file():
+                        start_epoch, best_acc1 = load_checkpoint(str(auto), model, opt, sched, scaler)
+
+                # training
+                acc1 = None
+                last_rel = None
+                best_rel = None
+
+                if not args.skip_train:
+                    for ep in range(start_epoch, args.epochs):
+                        if ddp_active and hasattr(train_loader.sampler, "set_epoch"):
+                            train_loader.sampler.set_epoch(ep)
+
+                        model.train()
+                        t0 = time.time()
+                        if torch.cuda.is_available():
+                            torch.cuda.reset_peak_memory_stats(device)
+
+                        tot_loss = 0.0
+                        seen = 0
+                        steps = len(train_loader)
+                        accum = max(1, args.accum)
+                        opt.zero_grad(set_to_none=True)
+
+                        for i, (x, y) in enumerate(train_loader):
+                            x = x.to(device, non_blocking=True).to(memory_format=torch.channels_last)
+                            y = y.to(device, non_blocking=True)
+                            with torch.amp.autocast(device_type='cuda', enabled=(not args.no_amp), dtype=amp_dtype):
+                                logits = model(x)
+                                loss = ce(logits, y) / accum
+                            if use_fp16_scaler:
+                                scaler.scale(loss).backward()
+                            else:
+                                loss.backward()
+
+                            if (i + 1) % accum == 0 or (i + 1) == steps:
+                                if args.clip and args.clip > 0:
+                                    if use_fp16_scaler:
+                                        scaler.unscale_(opt)
+                                    nn.utils.clip_grad_norm_(model.parameters(), args.clip)
+                                if use_fp16_scaler:
+                                    scaler.step(opt)
+                                    scaler.update()
+                                else:
+                                    opt.step()
+                                opt.zero_grad(set_to_none=True)
+
+                            tot_loss += loss.item() * accum * x.size(0)
+                            seen += x.size(0)
+
+                            # progress (rank 0)
+                            if rank == 0 and (i + 1) % max(1, steps // 10) == 0:
+                                print(f'ep {ep+1}/{args.epochs} it {i+1}/{steps} '
+                                      f'loss {tot_loss/max(1,seen):.4f}', flush=True)
+
+                        sched.step()
+                        dt = time.time() - t0
+                        imgs_per_s = seen / max(1e-6, dt)
+
+                        # validate every N epochs (and on last)
+                        do_val = ((ep + 1) % max(1, args.val_every) == 0) or (ep + 1 == args.epochs)
+                        if do_val:
+                            acc1 = evaluate_top1(model, val_loader, device)
+                        else:
+                            acc1 = None
+
+                        if rank == 0:
+                            max_mem = torch.cuda.max_memory_allocated(device) if torch.cuda.is_available() else 0
+                            acc_str = f"{acc1:.2f}%" if acc1 is not None else "NA"
+                            print(f'epoch {ep+1}/{args.epochs} acc1={acc_str} '
+                                  f'loss={tot_loss/max(1,seen):.4f} '
+                                  f'time={dt:.1f}s ({imgs_per_s:.1f} img/s) '
+                                  f'gpu_mem={sizeof_fmt(max_mem)}', flush=True)
+                            log_dict = {
+                                "loss": float(tot_loss/max(1,seen)),
+                                "imgs_per_s": float(imgs_per_s)
+                            }
+                            if acc1 is not None:
+                                log_dict["acc1"] = float(acc1)
+                            mlf.log_metrics(log_dict, step=ep+1)
+
+                            # checkpoints (per-config)
+                            is_save_epoch = ((ep + 1) % max(1, args.save_every) == 0) or (ep + 1 == args.epochs)
+                            if is_save_epoch:
+                                # update best on validation epochs only
+                                is_best = False
+                                if acc1 is not None and acc1 >= best_acc1:
+                                    best_acc1 = acc1
+                                    is_best = True
+
+                                base_state = {
+                                    "epoch": ep + 1,
+                                    "best_acc1": best_acc1 if best_acc1 != float("-inf") else None,
+                                    "model": (model.module if hasattr(model, "module") else model).state_dict(),
+                                    "opt": opt.state_dict(),
+                                    "sched": sched.state_dict(),
+                                    "scaler": scaler.state_dict(),
+                                    "cfg": asdict(cfg),
+                                    "args": vars(args)
+                                }
+                                last_path, new_best = save_checkpoint_pair(cfg_out, base_state, is_best=is_best)
+                                last_rel = str(Path(last_path).relative_to(out_dir))
+                                if new_best and is_best:
+                                    best_rel = str(Path(new_best).relative_to(out_dir))
+                                if args.keep_snapshots:
+                                    snap = cfg_out / f"ckpt_e{ep+1:03d}_a{(acc1 if acc1 is not None else float('nan')):.2f}.pt"
+                                    torch.save(base_state, snap)
+
+                    # metrics.json per-config
+                    if rank == 0:
+                        with open(cfg_out / "metrics.json", "w") as f:
+                            json.dump({
+                                "acc1_best": best_acc1 if best_acc1 != float("-inf") else None
+                            }, f, indent=2)
+
+                # end of one config
+                if rank == 0:
+                    # in case of skip_train, derive rel paths if any existing
+                    if last_rel is None and (cfg_out / "ckpt_last.pt").is_file():
+                        last_rel = str((cfg_out / "ckpt_last.pt").relative_to(out_dir))
+                    if best_rel is None and (cfg_out / "ckpt_best.pt").is_file():
+                        best_rel = str((cfg_out / "ckpt_best.pt").relative_to(out_dir))
+
+                    row = exp_row_dict(cfg, budget, best_acc1 if best_acc1 != float("-inf") else None,
+                                       args.epochs if not args.skip_train else 0,
+                                       str(cfg_out.relative_to(out_dir)), last_rel, best_rel)
+                    rows.append(row)
+                    write_csv_and_latex(rows, out_dir, fname='results')
+                    # log artifacts (per-config dir)
+                    mlf.log_artifacts(str(cfg_out))
+                    mlf.end_child()
+
+                # --- FREE GPU MEMORY BETWEEN CONFIGS ---
+                try:
+                    del model, opt, sched, scaler
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                except Exception:
+                    pass
 
     except KeyboardInterrupt:
         if rank == 0:
