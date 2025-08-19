@@ -17,7 +17,6 @@
 #   layer-wise lr decay (llrd)
 #   optional grad checkpointing
 
-# --- tame noisy third-party import logs (OpenVINO, HF telemetry) ---
 import os, warnings
 os.environ.setdefault("OPENVINO_LOG_LEVEL", "error")
 os.environ.setdefault("OV_LOG_LEVEL", "error")
@@ -45,12 +44,11 @@ from torch.utils.data import Dataset, DataLoader
 from torchvision import datasets, transforms
 from PIL import Image
 import xml.etree.ElementTree as ET
-from contextlib import contextmanager  # NEW
+from contextlib import contextmanager
 
-# Optional deps (degrade gracefully)
 try:
     import timm
-except Exception as _e:
+except Exception:
     timm = None
 
 try:
@@ -62,12 +60,10 @@ except Exception:
 
 import pandas as pd
 
-
 # ----------------------- small utilities ---------------------------------
 
 def now_utc() -> str:
     return _dt.datetime.utcnow().strftime("%Y-%m-%dT%H-%M-%SZ")
-
 
 def sizeof_fmt(num: float, suffix="B") -> str:
     for unit in ["", "K", "M", "G", "T", "P"]:
@@ -75,7 +71,6 @@ def sizeof_fmt(num: float, suffix="B") -> str:
             return f"{num:3.1f}{unit}{suffix}"
         num /= 1024.0
     return f"{num:.1f}E{suffix}"
-
 
 def set_seed(seed: int, deterministic: bool = False):
     random.seed(seed)
@@ -86,7 +81,6 @@ def set_seed(seed: int, deterministic: bool = False):
         os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
     else:
         torch.backends.cudnn.benchmark = True
-    # TF32 for Ampere+/Hopper (faster matmul/conv with minimal accuracy impact)
     if torch.cuda.is_available():
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
@@ -95,39 +89,25 @@ def set_seed(seed: int, deterministic: bool = False):
         except Exception:
             pass
 
-
 def ensure_dir(p: Path):
     p.mkdir(parents=True, exist_ok=True)
-
 
 # ----------- dataset root assertions & helpers (for cls-loc) ----------
 
 def _resolve_ilsvrc_root(root: Path) -> Path:
-    """
-    Accepts:
-      - <base> that contains 'ILSVRC/'
-      - 'ILSVRC/' itself
-      - '.../ILSVRC/Data/CLS-LOC' (will walk up)
-    Returns the 'ILSVRC/' directory.
-    """
     p = Path(root)
-    # Case 1: base contains ILSVRC
     if (p / "ILSVRC" / "Data" / "CLS-LOC").is_dir():
         return p / "ILSVRC"
-    # Case 2: p is ILSVRC
     if (p / "Data" / "CLS-LOC").is_dir() and p.name == "ILSVRC":
         return p
-    # Case 3: p ends with .../Data/CLS-LOC
     if p.name == "CLS-LOC" and p.parent.name == "Data" and p.parent.parent.name == "ILSVRC":
         return p.parent.parent
-    # Case 4: allow passing .../ILSVRC directly but without Data/CLS-LOC populated yet
     if p.name == "ILSVRC" and (p / "Data" / "CLS-LOC").exists():
         return p
     raise FileNotFoundError(
         f"Could not locate ILSVRC root from '{root}'. "
         "Expected one of: <base>/ILSVRC, <base>/ILSVRC/Data/CLS-LOC, or the ILSVRC directory itself."
     )
-
 
 def assert_imagenet_root(root: str, layout: str = "folder"):
     if layout == "folder":
@@ -137,7 +117,6 @@ def assert_imagenet_root(root: str, layout: str = "folder"):
             raise FileNotFoundError(
                 f"--imagenet must point to a folder with 'train' and 'val'. Got: {root}"
             )
-        # quick sanity: at least one class folder in each
         if not any(train.iterdir()):
             raise FileNotFoundError(f"No class folders found in {train}")
         if not any(val.iterdir()):
@@ -159,18 +138,12 @@ def assert_imagenet_root(root: str, layout: str = "folder"):
     else:
         raise ValueError(f"Unknown layout '{layout}' (choices: 'folder', 'cls-loc').")
 
-
 # ----------------------- model: gates ------------------------------------
 
 class SoftCodebookGate(nn.Module):
     """Soft top-k codebook gate: computes g(z)=Σ α_k E_k and scales target: target*(1+g)."""
     def __init__(
-        self,
-        K: int,
-        d_in: int,
-        d_g: int,
-        tau: float = 10.0,
-        topk: int = 8,
+        self, K: int, d_in: int, d_g: int, tau: float = 10.0, topk: int = 8,
         share_codebook: Optional[nn.Parameter] = None,
         share_E: Optional[nn.Parameter] = None,
         normalize: bool = True,
@@ -190,29 +163,23 @@ class SoftCodebookGate(nn.Module):
         self.normalize = normalize
 
     def forward(self, z, target):
-        # z: [B,N,d_in] (pre-MLP normed input), target: [B,N,d_g] (MLP hidden or output)
         zf = F.normalize(z, dim=-1) if self.normalize else z
         Cf = F.normalize(self.codebook, dim=-1) if self.normalize else self.codebook
         logits = self.tau * torch.einsum('bnd,kd->bnk', zf, Cf)  # [B,N,K]
         if self.topk is not None and self.topk < logits.shape[-1]:
-            vals, idx = torch.topk(logits, self.topk, dim=-1)       # [B,N,k]
-            alpha = F.softmax(vals, dim=-1)                          # [B,N,k]
-            Ek = self.E[idx]                                         # [B,N,k,d_g]
-            g = (alpha.unsqueeze(-1) * Ek).sum(dim=-2)               # [B,N,d_g]
+            vals, idx = torch.topk(logits, self.topk, dim=-1)
+            alpha = F.softmax(vals, dim=-1)
+            Ek = self.E[idx]
+            g = (alpha.unsqueeze(-1) * Ek).sum(dim=-2)
         else:
-            alpha = F.softmax(logits, dim=-1)                        # [B,N,K]
-            g = torch.einsum('bnk,kd->bnd', alpha, self.E)           # [B,N,d_g]
+            alpha = F.softmax(logits, dim=-1)
+            g = torch.einsum('bnk,kd->bnd', alpha, self.E)
         return target * (1.0 + g)
-
 
 class VQGate(nn.Module):
     """Hard 1-of-K gate with straight-through estimator."""
     def __init__(
-        self,
-        K: int,
-        d_in: int,
-        d_g: int,
-        tau: float = 20.0,
+        self, K: int, d_in: int, d_g: int, tau: float = 20.0,
         share_codebook: Optional[nn.Parameter] = None,
         share_E: Optional[nn.Parameter] = None,
         normalize: bool = True,
@@ -233,33 +200,30 @@ class VQGate(nn.Module):
     def forward(self, z, target):
         zf = F.normalize(z, dim=-1) if self.normalize else z
         Cf = F.normalize(self.codebook, dim=-1) if self.normalize else self.codebook
-        logits = self.tau * torch.einsum('bnd,kd->bnk', zf, Cf)      # [B,N,K]
+        logits = self.tau * torch.einsum('bnd,kd->bnk', zf, Cf)
         soft = F.softmax(logits, dim=-1)
-        hard_idx = torch.argmax(soft, dim=-1, keepdim=True)          # [B,N,1]
+        hard_idx = torch.argmax(soft, dim=-1, keepdim=True)
         hard = torch.zeros_like(soft).scatter_(-1, hard_idx, 1.0)
-        alpha_st = (hard - soft).detach() + soft                     # STE
-        g = torch.einsum('bnk,kd->bnd', alpha_st, self.E)            # [B,N,d_g]
+        alpha_st = (hard - soft).detach() + soft
+        g = torch.einsum('bnk,kd->bnd', alpha_st, self.E)
         return target * (1.0 + g)
-
 
 class MlpWithGateWidth(nn.Module):
     """Gate the MLP OUTPUT (dimension d)."""
     def __init__(self, mlp: nn.Module, gate: nn.Module):
         super().__init__()
         self.mlp = mlp
-        self.gate = gate  # expects (z, y_out) -> y_out * (1+g)
+        self.gate = gate
 
     def forward(self, x):
-        y = self.mlp(x)                # [B,N,d]
+        y = self.mlp(x)
         return self.gate(x, y)
-
 
 class MlpWithGateExpand(nn.Module):
     """Gate the MLP HIDDEN after fc1/act/drop (dimension d_ff ≈ 4d)."""
     def __init__(self, mlp: nn.Module, gate: nn.Module):
         super().__init__()
         self.mlp = mlp
-        # Be robust to timm variants
         self.fc1 = getattr(mlp, 'fc1', getattr(mlp, 'linear1', None))
         self.fc2 = getattr(mlp, 'fc2', getattr(mlp, 'linear2', None))
         if self.fc1 is None or self.fc2 is None:
@@ -267,22 +231,19 @@ class MlpWithGateExpand(nn.Module):
         self.act = getattr(mlp, 'act', getattr(mlp, 'act_layer', nn.GELU()))
         self.drop1 = getattr(mlp, 'drop1', getattr(mlp, 'drop', nn.Identity()))
         self.drop2 = getattr(mlp, 'drop2', getattr(mlp, 'drop', nn.Identity()))
-        self.gate = gate               # expects (z, h) -> h * (1+g), g ∈ R^{d_ff}
-        # Expose hidden dim for budget inference post-wrapping
+        self.gate = gate
         self.gate_hidden_dim = self.fc1.out_features
 
     def forward(self, x):
         h = self.fc1(x)
         h = self.act(h)
-        h = self.drop1(h)              # [B,N,d_ff]
-        h = self.gate(x, h)            # gate at hidden
+        h = self.drop1(h)
+        h = self.gate(x, h)
         y = self.fc2(h)
-        y = self.drop2(y)              # [B,N,d]
+        y = self.drop2(y)
         return y
 
-
 def _infer_hidden_dim_from_mlp(mlp: nn.Module, fallback: int) -> int:
-    # works both before and after wrapping
     if hasattr(mlp, 'gate_hidden_dim'):
         return int(getattr(mlp, 'gate_hidden_dim'))
     for obj in (mlp, getattr(mlp, 'mlp', None)):
@@ -292,27 +253,22 @@ def _infer_hidden_dim_from_mlp(mlp: nn.Module, fallback: int) -> int:
                 return int(getattr(obj, name).out_features)
     return int(fallback)
 
-
 def attach_gates(
     vit: nn.Module,
     kind: str = 'soft',
     K: int = 512,
-    d_g_mode: str = 'expand',  # 'expand' (4d) or 'width' (d)
+    d_g_mode: str = 'expand',
     topk: Optional[int] = 8,
     tau: float = 10.0,
     share_codebook_across_depth: bool = True,
     share_E_across_depth: bool = False,
 ):
-    """Attach a gate to every block's MLP with optional sharing across depth."""
     d_in = vit.embed_dim
-
-    # optional shared codebook across depth
     codebook_shared: Optional[nn.Parameter] = None
     if share_codebook_across_depth:
         codebook_shared = nn.Parameter(torch.randn(K, d_in) / math.sqrt(d_in))
         vit.register_parameter('deepembed_codebook', codebook_shared)
 
-    # optional shared E across depth (shape depends on d_g_mode)
     E_shared: Optional[nn.Parameter] = None
     if share_E_across_depth:
         d_g_example = d_in if d_g_mode == 'width' else _infer_hidden_dim_from_mlp(
@@ -321,98 +277,67 @@ def attach_gates(
         E_shared = nn.Parameter(torch.zeros(K, d_g_example))
         vit.register_parameter('deepembed_E', E_shared)
 
-    # gentle guardrail: VQ ignores topk; warn once if user set it
     _warned_vq_topk = False
-
     for li, blk in enumerate(vit.blocks):
-        # read hidden dim from original mlp (before wrapping)
         d_ff = _infer_hidden_dim_from_mlp(blk.mlp, fallback=4 * d_in)
         d_g = d_ff if d_g_mode == 'expand' else d_in
-
-        # choose per-block or shared codebook
         cb_param = codebook_shared
-        if cb_param is None:  # per-layer codebook
+        if cb_param is None:
             cb_param = nn.Parameter(torch.randn(K, d_in) / math.sqrt(d_in))
-            setattr(blk, f'deepembed_codebook_{li:02d}', cb_param)  # register under block
+            setattr(blk, f'deepembed_codebook_{li:02d}', cb_param)
 
         if kind == 'soft':
-            # Only Soft gate takes 'topk'
             gate = SoftCodebookGate(
-                K, d_in, d_g,
-                tau=tau,
-                topk=topk if (topk is not None) else K,
-                share_codebook=cb_param,
-                share_E=E_shared
+                K, d_in, d_g, tau=tau, topk=topk if (topk is not None) else K,
+                share_codebook=cb_param, share_E=E_shared
             )
         elif kind == 'vq':
             if (topk is not None) and not _warned_vq_topk:
                 print("[CDE] Warning: 'topk' is ignored for VQ; using hard 1-of-K.", flush=True)
                 _warned_vq_topk = True
-            gate = VQGate(
-                K, d_in, d_g,
-                tau=max(12.0, tau),
-                share_codebook=cb_param,
-                share_E=E_shared
-            )
+            gate = VQGate(K, d_in, d_g, tau=max(12.0, tau), share_codebook=cb_param, share_E=E_shared)
         else:
-            continue  # no gate
+            continue
 
         if d_g_mode == 'expand':
             blk.mlp = MlpWithGateExpand(blk.mlp, gate)
         else:
             blk.mlp = MlpWithGateWidth(blk.mlp, gate)
 
-
 # ----------------------- attention: RoPE (rotary) ------------------------
 
 def _rope_freqs(head_dim: int, seq_len: int, theta: float, device, dtype):
-    """Classic 1D RoPE cache. Returns cos/sin with shape [seq_len, head_dim]."""
     assert head_dim % 2 == 0, "head_dim must be even for RoPE"
     inv_freq = 1.0 / (theta ** (torch.arange(0, head_dim, 2, device=device, dtype=torch.float32) / head_dim))
-    t = torch.arange(seq_len, device=device, dtype=torch.float32)  # [seq_len]
-    freqs = torch.einsum('n,d->nd', t, inv_freq)                   # [seq_len, head_dim/2]
-    cos = torch.cos(freqs).to(dtype).repeat_interleave(2, dim=-1)  # [seq_len, head_dim]
+    t = torch.arange(seq_len, device=device, dtype=torch.float32)
+    freqs = torch.einsum('n,d->nd', t, inv_freq)
+    cos = torch.cos(freqs).to(dtype).repeat_interleave(2, dim=-1)
     sin = torch.sin(freqs).to(dtype).repeat_interleave(2, dim=-1)
     return cos, sin
 
-
 def _rope_rotate_half(x: torch.Tensor) -> torch.Tensor:
-    # x: [..., head_dim] with even head_dim
-    x1 = x[..., ::2]
-    x2 = x[..., 1::2]
+    x1 = x[..., ::2]; x2 = x[..., 1::2]
     out = torch.stack((-x2, x1), dim=-1)
     return out.flatten(-2)
 
-
 def _apply_rope(q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor):
-    """
-    q, k: [B, H, N, Hd], cos/sin: [N, Hd]
-    returns rotated q, k with broadcasting over batch & heads.
-    """
-    cos = cos.unsqueeze(0).unsqueeze(0)  # [1,1,N,Hd]
+    cos = cos.unsqueeze(0).unsqueeze(0)
     sin = sin.unsqueeze(0).unsqueeze(0)
     q_rot = (q * cos) + (_rope_rotate_half(q) * sin)
     k_rot = (k * cos) + (_rope_rotate_half(k) * sin)
     return q_rot, k_rot
 
-
 class AttentionWithRoPE(nn.Module):
-    """
-    wrap timm attention and apply 1d or 2d RoPE to q & k.
-    if grid inference fails in 2d mode, we fall back to 1d once.
-    """
     def __init__(self, attn: nn.Module, theta: float = 10000.0, kind: str = '1d',
                  grid_size: Optional[Tuple[int,int]] = None):
         super().__init__()
         self.attn = attn
         self.theta = float(theta)
         self.kind = kind if kind in ('1d', '2d') else '1d'
-        # (H, W) of patch grid if known; used for 2d mapping
         self.grid_size = tuple(grid_size) if (grid_size is not None) else None
         self._warned_fallback = False
-        # simple caches to avoid rebuilding cos/sin every forward
-        self._cache_1d = {}   # key: (N, Hd, dtype, device) -> (cos, sin)
-        self._cache_2d = {}   # key: (GH, GW, Hd_half, dtype, device) -> (cos_full, sin_full)
+        self._cache_1d = {}
+        self._cache_2d = {}
 
     def _get_1d_cos_sin(self, N, Hd, dtype, device):
         key = (int(N), int(Hd), dtype, device)
@@ -446,14 +371,13 @@ class AttentionWithRoPE(nn.Module):
             B, N, C = x.shape
             H = self.attn.num_heads
             Hd = C // H
-            qkv = self.attn.qkv(x).reshape(B, N, 3, H, Hd).permute(2, 0, 3, 1, 4)  # 3,B,H,N,Hd
-            q, k, v = qkv[0], qkv[1], qkv[2]                                        # B,H,N,Hd
+            qkv = self.attn.qkv(x).reshape(B, N, 3, H, Hd).permute(2, 0, 3, 1, 4)
+            q, k, v = qkv[0], qkv[1], qkv[2]
             q = q * getattr(self.attn, 'scale', (Hd ** -0.5))
 
             device, dtype = q.device, q.dtype
-            # build cos/sin per position
             if self.kind == '2d' and N > 1 and (Hd % 2 == 0):
-                L = N - 1  # exclude cls
+                L = N - 1
                 GH = GW = None
                 if self.grid_size is not None:
                     GH, GW = int(self.grid_size[0]), int(self.grid_size[1])
@@ -474,22 +398,17 @@ class AttentionWithRoPE(nn.Module):
                 cos, sin = self._get_1d_cos_sin(N, Hd, dtype, device)
                 q, k = _apply_rope(q, k, cos, sin)
 
-            # ---- SDPA / FlashAttention path (fast) ----
             drop_p = float(getattr(getattr(self.attn, 'attn_drop', None), 'p', 0.0)) if self.training else 0.0
-            x = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask,
-                                               dropout_p=drop_p, is_causal=False)
+            x = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, dropout_p=drop_p, is_causal=False)
             x = x.transpose(1, 2).reshape(B, N, C)
             x = self.attn.proj(x)
             if hasattr(self.attn, 'proj_drop') and self.attn.proj_drop is not None:
                 x = self.attn.proj_drop(x)
             return x
         except Exception:
-            # fall back to the original module, forwarding any provided mask
             return self.attn(x, attn_mask=attn_mask)
 
-
 def attach_rope(vit: nn.Module, theta: float = 10000.0, kind: str = '1d'):
-    """replace each block.attn by an AttentionWithRoPE wrapper (passes patch grid)."""
     grid = None
     try:
         pe = getattr(vit, 'patch_embed', None)
@@ -502,9 +421,7 @@ def attach_rope(vit: nn.Module, theta: float = 10000.0, kind: str = '1d'):
         if hasattr(blk, 'attn') and isinstance(blk.attn, nn.Module):
             blk.attn = AttentionWithRoPE(blk.attn, theta=theta, kind=kind, grid_size=grid)
 
-
 def disable_abs_pos_embed(vit: nn.Module, zero_weights: bool = True):
-    """Disable learned absolute pos embed (recommended with RoPE)."""
     pe = getattr(vit, 'pos_embed', None)
     if isinstance(pe, torch.nn.Parameter):
         if zero_weights:
@@ -512,10 +429,9 @@ def disable_abs_pos_embed(vit: nn.Module, zero_weights: bool = True):
                 pe.data.zero_()
         pe.requires_grad_(False)
 
-
 # ----------------------- accounting --------------------------------------
 
-BASELINE_GFLOPS_DEIT_S_224 = 4.6  # reported (MAC-based)
+BASELINE_GFLOPS_DEIT_S_224 = 4.6
 
 @dataclass
 class Budget:
@@ -523,28 +439,16 @@ class Budget:
     est_gflops_total: float
     est_gflops_overhead: float
 
-
 def count_params_m(model: nn.Module) -> float:
     return sum(p.numel() for p in model.parameters()) / 1e6
 
-
 def estimate_gate_overhead_gflops(
-    K: int,
-    d_in: int,
-    d_g: int,
-    N: int,
-    L: int,
-    k: int,
-    assign_once: bool = True,
+    K: int, d_in: int, d_g: int, N: int, L: int, k: int, assign_once: bool = True,
 ) -> float:
-    # assignment cost: N*K*d_in (once or per-layer)
     assign = (N * K * d_in) * (1 if assign_once else L)
-    # mixing cost (soft top-k): N*L*k*d_g; vq has k=1 but we still do one gather
     mix = N * L * k * d_g
-    # apply gate (mul): N*L*d_g
     apply = N * L * d_g
     return (assign + mix + apply) / 1e9
-
 
 def _infer_d_g(model: nn.Module, d_g_mode: str) -> int:
     if d_g_mode != 'expand':
@@ -555,16 +459,9 @@ def _infer_d_g(model: nn.Module, d_g_mode: str) -> int:
     except Exception:
         return int(4 * model.embed_dim)
 
-
 def compute_budget(
-    model: nn.Module,
-    gate: str,
-    K: int,
-    topk: Optional[int],
-    d_g_mode: str,
-    assign_once: bool,
-    tokens: int = 197,
-    share_codebook: bool = True,
+    model: nn.Module, gate: str, K: int, topk: Optional[int], d_g_mode: str,
+    assign_once: bool, tokens: int = 197, share_codebook: bool = True,
 ) -> Budget:
     d_in = model.embed_dim
     L = len(model.blocks)
@@ -577,24 +474,12 @@ def compute_budget(
     total = BASELINE_GFLOPS_DEIT_S_224 + overhead
     return Budget(count_params_m(model), total, overhead)
 
-
 # ----------------------- data --------------------------------------------
 
 IMAGENET_MEAN = [0.485, 0.456, 0.406]
 IMAGENET_STD  = [0.229, 0.224, 0.225]
 
-
 class ImageNetClsLoc(Dataset):
-    """
-    ImageNet classification dataset over the Kaggle ILSVRC CLS-LOC layout.
-
-    Train:
-      <root>/ILSVRC/Data/CLS-LOC/train/<wnid>/*.JPEG   (folders define classes)
-
-    Val:
-      <root>/ILSVRC/Data/CLS-LOC/val/*.JPEG            (flat)
-      <root>/ILSVRC/Annotations/CLS-LOC/val/<stem>.xml (labels: first object/name -> wnid)
-    """
     IMG_EXTS = {".jpeg", ".jpg", ".JPEG", ".JPG"}
 
     def __init__(self, root: str, split: str, transform=None):
@@ -602,12 +487,10 @@ class ImageNetClsLoc(Dataset):
         self.transform = transform
         self.split = split.lower()
         ils = _resolve_ilsvrc_root(Path(root))
-
         self.data_dir = ils / "Data" / "CLS-LOC" / self.split
         self.ann_dir  = ils / "Annotations" / "CLS-LOC" / self.split
 
         if self.split == "train":
-            # classes from folders
             class_dirs = [p for p in self.data_dir.iterdir() if p.is_dir()]
             self.classes = sorted([p.name for p in class_dirs])
             self.class_to_idx = {c: i for i, c in enumerate(self.classes)}
@@ -619,17 +502,15 @@ class ImageNetClsLoc(Dataset):
                         samples.append((str(imgp), idx))
             self.samples = samples
         elif self.split == "val":
-            # classes derived from TRAIN (stable ordering)
             train_dir = ils / "Data" / "CLS-LOC" / "train"
             class_dirs = [p for p in train_dir.iterdir() if p.is_dir()]
             self.classes = sorted([p.name for p in class_dirs])
             self.class_to_idx = {c: i for i, c in enumerate(self.classes)}
             imgs = sorted([p for p in self.data_dir.iterdir() if p.suffix in self.IMG_EXTS])
             samples = []
-            miss_xml = 0
-            miss_wnid = 0
-            for i, imgp in enumerate(imgs, 1):
-                stem = imgp.stem  # e.g., ILSVRC2012_val_00000001
+            miss_xml = miss_wnid = 0
+            for imgp in imgs:
+                stem = imgp.stem
                 xmlp = self.ann_dir / f"{stem}.xml"
                 if not xmlp.is_file():
                     miss_xml += 1
@@ -666,23 +547,12 @@ class ImageNetClsLoc(Dataset):
             im = self.transform(im)
         return im, target
 
-
 def make_imagenet_loaders(
-    root: str,
-    bs: int,
-    workers: Optional[int] = None,
-    size: int = 224,
-    ddp: bool = False,
-    rank: int = 0,
-    world_size: int = 1,
-    layout: str = "folder",   # existing
-    prefetch: int = 6,        # NEW
-    drop_last: bool = False,  # NEW
-    randaug_n: int = 2,
-    randaug_m: int = 9,
+    root: str, bs: int, workers: Optional[int] = None, size: int = 224,
+    ddp: bool = False, rank: int = 0, world_size: int = 1, layout: str = "folder",
+    prefetch: int = 6, drop_last: bool = False, randaug_n: int = 2, randaug_m: int = 9,
     random_erase: float = 0.25,
 ):
-    """Create loaders; on Windows, default to workers=0 to avoid spawn spam unless user overrides."""
     if workers is None:
         workers = 0 if os.name == "nt" else min(8, os.cpu_count() or 8)
 
@@ -693,14 +563,9 @@ def make_imagenet_loaders(
                                      interpolation=transforms.InterpolationMode.BICUBIC),
         transforms.RandomHorizontalFlip(),
     ]
-    if ra is not None:
-        train_ops.append(ra)
-    train_ops += [
-        transforms.ToTensor(),
-        transforms.Normalize(IMAGENET_MEAN, IMAGENET_STD),
-    ]
-    if re is not None:
-        train_ops.append(re)
+    if ra is not None: train_ops.append(ra)
+    train_ops += [transforms.ToTensor(), transforms.Normalize(IMAGENET_MEAN, IMAGENET_STD)]
+    if re is not None: train_ops.append(re)
     train_tf = transforms.Compose(train_ops)
 
     val_tf = transforms.Compose([
@@ -734,7 +599,6 @@ def make_imagenet_loaders(
     pin = torch.cuda.is_available()
     persistent = workers > 0
 
-    # Note: prefetch_factor is used only when workers > 0.
     train_loader = DataLoader(
         train_ds, batch_size=bs, shuffle=(train_sampler is None),
         sampler=train_sampler, num_workers=workers, pin_memory=pin,
@@ -748,10 +612,8 @@ def make_imagenet_loaders(
         pin_memory_device=("cuda" if pin else "")
     )
 
-    # number of classes
     n_classes = len(train_ds.classes) if hasattr(train_ds, "classes") else 1000
     return train_loader, val_loader, n_classes
-
 
 # ----------------------- training utils ----------------------------------
 
@@ -765,15 +627,12 @@ class WarmupCosine(torch.optim.lr_scheduler._LRScheduler):
         ep = self.last_epoch + 1
         if ep <= self.warmup_epochs:
             return [base_lr * ep / max(1, self.warmup_epochs) for base_lr in self.base_lrs]
-        # cosine decay
         t = (ep - self.warmup_epochs) / max(1, self.max_epochs - self.warmup_epochs)
         cos = 0.5 * (1 + math.cos(math.pi * t))
         return [base_lr * cos for base_lr in self.base_lrs]
 
-
 def build_param_groups(model: nn.Module, weight_decay: float,
                        base_lr: Optional[float] = None, layer_decay: float = 1.0) -> List[Dict[str, Any]]:
-    """AdamW param groups with (optional) LLRD; no weight decay for biases/LayerNorms."""
     if (base_lr is None) or (layer_decay >= 0.9999):
         decay, no_decay = [], []
         for n, p in model.named_parameters():
@@ -786,16 +645,13 @@ def build_param_groups(model: nn.Module, weight_decay: float,
             {"params": decay, "weight_decay": weight_decay},
             {"params": no_decay, "weight_decay": 0.0},
         ]
-    # layer-wise lr decay
-    num_layers = (len(getattr(model, "blocks", [])) if hasattr(model, "blocks") else 0) + 2  # embed..blocks..head
+    num_layers = (len(getattr(model, "blocks", [])) if hasattr(model, "blocks") else 0) + 2
     def _layer_id(name: str) -> int:
         if name.startswith("patch_embed") or ("pos_embed" in name) or ("cls_token" in name):
             return 0
         if name.startswith("blocks."):
-            try:
-                lid = int(name.split(".")[1])
-            except Exception:
-                lid = 0
+            try: lid = int(name.split(".")[1])
+            except Exception: lid = 0
             return lid + 1
         return num_layers - 1
     groups: Dict[Tuple[float, float], Dict[str, Any]] = {}
@@ -811,7 +667,6 @@ def build_param_groups(model: nn.Module, weight_decay: float,
         groups[key]["params"].append(p)
     return list(groups.values())
 
-
 @torch.no_grad()
 def evaluate_top1(model: nn.Module, loader: DataLoader, device: torch.device) -> float:
     model.eval()
@@ -825,7 +680,6 @@ def evaluate_top1(model: nn.Module, loader: DataLoader, device: torch.device) ->
         tot += y.numel()
     return 100.0 * correct / max(1, tot)
 
-
 # ----------------------- losses, aug, ema --------------------------------
 
 def one_hot(y: torch.Tensor, num_classes: int, smoothing: float = 0.0) -> torch.Tensor:
@@ -838,11 +692,8 @@ def one_hot(y: torch.Tensor, num_classes: int, smoothing: float = 0.0) -> torch.
         out.scatter_(1, y.unsqueeze(1), on)
     return out
 
-
 def soft_cross_entropy(logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
-    # logits: [B,C], targets: [B,C] (probabilities)
     return (-targets * F.log_softmax(logits, dim=-1)).sum(dim=-1).mean()
-
 
 def _rand_bbox(w: int, h: int, lam: float):
     cut_rat = math.sqrt(1.0 - lam)
@@ -856,9 +707,8 @@ def _rand_bbox(w: int, h: int, lam: float):
     y2 = min(cy + cut_h // 2, h)
     return x1, y1, x2, y2
 
-
 def apply_mixup(x: torch.Tensor, y: torch.Tensor, num_classes: int, alpha: float):
-    if alpha <= 0.0:  # no-op
+    if alpha <= 0.0:
         return x, one_hot(y, num_classes)
     lam = torch.distributions.Beta(alpha, alpha).sample().item()
     index = torch.randperm(x.size(0), device=x.device)
@@ -867,7 +717,6 @@ def apply_mixup(x: torch.Tensor, y: torch.Tensor, num_classes: int, alpha: float
     x_m = lam * x + (1.0 - lam) * x[index]
     t_m = lam * y1 + (1.0 - lam) * y2
     return x_m, t_m
-
 
 def apply_cutmix(x: torch.Tensor, y: torch.Tensor, num_classes: int, alpha: float):
     if alpha <= 0.0:
@@ -884,17 +733,14 @@ def apply_cutmix(x: torch.Tensor, y: torch.Tensor, num_classes: int, alpha: floa
     t_m = lam_adj * one_hot(y, num_classes) + (1.0 - lam_adj) * y2
     return x_m, t_m
 
-
-def _unwrap(m):  # helper for DDP/no-DDP
+def _unwrap(m):
     return m.module if hasattr(m, "module") else m
-
 
 class ModelEMA(nn.Module):
     """
-    Exponential Moving Average of model parameters (robust):
-    - updates by state_dict keys (no reliance on param order),
-    - copies non-float & 'running_*' buffers directly (keeps BN stats sane),
-    - optional short warmup so EMA catches up early.
+    Exponential Moving Average (robust, simple):
+    - linear warmup: decay ramps 0 → base_decay over `warmup` updates
+    - non-float & 'running_*' buffers copied directly
     """
     def __init__(self, model: nn.Module, decay: float = 0.9997, device: Optional[torch.device] = None,
                  warmup: int = 2000):
@@ -909,9 +755,8 @@ class ModelEMA(nn.Module):
         self.updates = 0
 
     def _decay(self) -> float:
-        if self.updates < self.warmup:
-            t = self.updates
-            return 1.0 - (1.0 - self.base_decay) * (t + 1) / (self.warmup + 1)
+        if self.warmup > 0 and self.updates < self.warmup:
+            return self.base_decay * (self.updates / float(self.warmup))  # 0 -> base_decay
         return self.base_decay
 
     @torch.no_grad()
@@ -921,16 +766,13 @@ class ModelEMA(nn.Module):
         msd = _unwrap(model).state_dict()
         esd = self.module.state_dict()
         for k, v in msd.items():
-            # copy integer & non-float buffers directly
             if not hasattr(v, "dtype") or not v.dtype.is_floating_point:
                 esd[k].copy_(v)
                 continue
-            # keep 'running_*' buffers (e.g., BatchNorm stats) in sync exactly
             if k.startswith('running_') or ('running_' in k) or k.endswith('num_batches_tracked'):
                 esd[k].copy_(v)
             else:
                 esd[k].mul_(d).add_(v, alpha=1.0 - d)
-
 
 # ----------------------- MLflow & checkpoints ----------------------------
 
@@ -988,7 +830,6 @@ class MLflowLogger:
         try: mlflow.end_run()
         except Exception: pass
 
-
 def save_checkpoint_pair(cfg_out: Path, state: Dict[str, Any], is_best: bool):
     ensure_dir(cfg_out)
     last_path = cfg_out / "ckpt_last.pt"
@@ -998,17 +839,14 @@ def save_checkpoint_pair(cfg_out: Path, state: Dict[str, Any], is_best: bool):
         torch.save(state, best_path)
     return str(last_path), (str(cfg_out / "ckpt_best.pt") if is_best else None)
 
-
 def load_checkpoint(path: str, model: nn.Module, opt=None, sched=None, scaler=None, ema: Optional[ModelEMA] = None) -> Tuple[int, float]:
     ckpt = torch.load(path, map_location="cpu")
     _unwrap(model).load_state_dict(ckpt["model"], strict=True)
     if opt and "opt" in ckpt: opt.load_state_dict(ckpt["opt"])
     if sched and "sched" in ckpt: sched.load_state_dict(ckpt["sched"])
     if scaler and "scaler" in ckpt and ckpt["scaler"] is not None:
-        try:
-            scaler.load_state_dict(ckpt["scaler"])
-        except Exception:
-            pass
+        try: scaler.load_state_dict(ckpt["scaler"])
+        except Exception: pass
     if ema is not None and "model_ema" in ckpt and ckpt["model_ema"] is not None:
         try:
             ema.module.load_state_dict(ckpt["model_ema"], strict=True)
@@ -1019,21 +857,18 @@ def load_checkpoint(path: str, model: nn.Module, opt=None, sched=None, scaler=No
     print(f"[resume] loaded {path} (epoch={start_epoch}, best={best:.2f})")
     return start_epoch, best
 
-
 # ----------------------- experiment grid ---------------------------------
 
 @dataclass
 class ExpCfg:
-    gate: str            # 'none' | 'vq' | 'soft'
-    K: int               # codebook size
-    topk: Optional[int]  # for soft; None for vq/none
-    d_g_mode: str        # 'width' | 'expand'
-    tau: float           # temperature
-    assign_once: bool    # for est flops only
-    # depth sharing toggles
-    share_codebook: bool = True  # True: one codebook across depth; False: per-layer codebook
-    share_E: bool = False        # True: one E across depth; False: per-layer E (default)
-
+    gate: str
+    K: int
+    topk: Optional[int]
+    d_g_mode: str
+    tau: float
+    assign_once: bool
+    share_codebook: bool = True
+    share_E: bool = False
 
 def build_model(cfg: ExpCfg, num_classes: int = 1000, model_kwargs: Optional[Dict[str, Any]] = None) -> nn.Module:
     if timm is None:
@@ -1049,11 +884,9 @@ def build_model(cfg: ExpCfg, num_classes: int = 1000, model_kwargs: Optional[Dic
         )
     return model
 
-
 def cfg_hash(cfg: "ExpCfg") -> str:
     s = json.dumps(asdict(cfg), sort_keys=True)
     return hashlib.sha1(s.encode("utf-8")).hexdigest()[:8]
-
 
 def cfg_slug(cfg: "ExpCfg") -> str:
     topk = cfg.topk if cfg.topk is not None else "n"
@@ -1061,10 +894,8 @@ def cfg_slug(cfg: "ExpCfg") -> str:
     e  = "eS" if getattr(cfg, "share_E", False) else "eL"
     return f"{cfg.gate}-K{cfg.K}-k{topk}-{cfg.d_g_mode}-t{cfg.tau:g}-{cb}-{e}"
 
-
 def cfg_dir(base: Path, idx: int, cfg: "ExpCfg") -> Path:
     return base / f"{idx:02d}_{cfg_slug(cfg)}_{cfg_hash(cfg)}"
-
 
 def exp_row_dict(cfg: ExpCfg, budget: Budget, acc1: Optional[float], epochs: int,
                  cfg_rel_dir: str, last_rel: Optional[str], best_rel: Optional[str]) -> dict:
@@ -1087,7 +918,6 @@ def exp_row_dict(cfg: ExpCfg, budget: Budget, acc1: Optional[float], epochs: int
         'ckpt_best': best_rel or '-',
     }
 
-
 def default_grid() -> List[ExpCfg]:
     return [
         ExpCfg('none', 0, None, 'width', 0.0, True),
@@ -1097,9 +927,7 @@ def default_grid() -> List[ExpCfg]:
         ExpCfg('soft', 512, 8, 'expand', 10.0, True),
     ]
 
-
 def load_grid(arg: str) -> List[ExpCfg]:
-    """Accept 'default' | 'smoke' | path to JSON (list of dicts)."""
     PREDEF = {
         "smoke": [
             {"gate":"none","K":0,"topk":None,"d_g_mode":"width","tau":10.0,"assign_once":True},
@@ -1120,14 +948,11 @@ def load_grid(arg: str) -> List[ExpCfg]:
     norm: List[ExpCfg] = []
     for g in data:
         g = dict(g)
-        # legacy alias support
         if "dg" in g and "d_g_mode" not in g:
             g["d_g_mode"] = g.pop("dg")
         if g.get("topk") in (0, "0"):
             g["topk"] = None
         g.setdefault("assign_once", True)
-        # sharing defaults + aliases
-        # aliases: codebook_per_layer / cb_per_layer -> share_codebook = not(...)
         if "share_codebook" not in g:
             per_layer_alias = g.pop("codebook_per_layer", None)
             per_layer_alias = g.pop("cb_per_layer", per_layer_alias)
@@ -1139,21 +964,16 @@ def load_grid(arg: str) -> List[ExpCfg]:
         norm.append(ExpCfg(**g))
     return norm
 
-
 def write_csv_and_latex(rows: List[dict], out_dir: Path, fname: str = 'results'):
     if not rows: return
     ensure_dir(out_dir)
     csv_path = out_dir / f'{fname}.csv'
     tex_path = out_dir / f'{fname}.tex'
-
-    # CSV
     with open(csv_path, 'w', newline='') as f:
         w = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
         w.writeheader()
         for r in rows:
             w.writerow(r)
-
-    # LaTeX
     cols = ['model','gate','K','topk','d_g','assign_once','cb_shared','E_shared',
             'params_M','GFLOPs_total','GFLOPs_overhead','epochs','top1_acc',
             'ckpt_dir','ckpt_last','ckpt_best']
@@ -1175,37 +995,28 @@ def write_csv_and_latex(rows: List[dict], out_dir: Path, fname: str = 'results')
     print(f'wrote {csv_path}')
     print(f'wrote {tex_path}')
 
-
 # ----------------------- SDPA backend compat shim ------------------------
 
-# Prefer new torch.nn.attention.sdpa_kernel; fallback to legacy torch.backends.cuda.sdp_kernel
 try:
     from torch.nn.attention import sdpa_kernel as _sdpa_kernel_new
     from torch.nn.attention import SDPBackend as _SDPBackend
-
     def set_sdpa_backend(pref: str):
-        # Map CLI choices to backend preference tuples
         if pref == 'flash':
             backends = [_SDPBackend.FLASH_ATTENTION, _SDPBackend.EFFICIENT_ATTENTION]
         elif pref == 'mem_efficient':
             backends = [_SDPBackend.EFFICIENT_ATTENTION,]
         elif pref == 'math':
             backends = [_SDPBackend.MATH,]
-        else:  # auto
+        else:
             backends = [_SDPBackend.FLASH_ATTENTION, _SDPBackend.EFFICIENT_ATTENTION, _SDPBackend.MATH]
-
         @contextmanager
         def _ctx():
-            # New API accepts an iterable of backends
             with _sdpa_kernel_new(backends):
                 yield
         return _ctx()
-
 except Exception:
-    # Legacy API
     try:
         from torch.backends.cuda import sdp_kernel as _sdpa_kernel_legacy
-
         def set_sdpa_backend(pref: str):
             if pref == 'flash':
                 kw = dict(enable_flash=True,  enable_mem_efficient=True,  enable_math=False)
@@ -1213,22 +1024,19 @@ except Exception:
                 kw = dict(enable_flash=False, enable_mem_efficient=True,  enable_math=False)
             elif pref == 'math':
                 kw = dict(enable_flash=False, enable_mem_efficient=False, enable_math=True)
-            else:  # auto
+            else:
                 kw = dict(enable_flash=True,  enable_mem_efficient=True,  enable_math=True)
-
             @contextmanager
             def _ctx():
                 with _sdpa_kernel_legacy(**kw):
                     yield
             return _ctx()
     except Exception:
-        # No-op shim
         def set_sdpa_backend(pref: str):
             @contextmanager
             def _ctx():
                 yield
             return _ctx()
-
 
 # ----------------------- dtype helper ------------------------------------
 
@@ -1238,150 +1046,115 @@ def _dtype_from_str(name: str):
     if name == 'fp16': return torch.float16
     return torch.float32
 
-
 # ----------------------- main --------------------------------------------
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--imagenet', type=str, required=True,
-                    help='root for ImageNet. '
-                         "If --imagenet_layout=folder, it must contain 'train/' and 'val/'. "
-                         "If --imagenet_layout=cls-loc, it may be the parent containing 'ILSVRC/', the 'ILSVRC/' folder, or even '.../ILSVRC/Data/CLS-LOC'.")
-    ap.add_argument('--imagenet_layout', type=str, default='folder', choices=['folder','cls-loc'],
-                    help="Directory layout of the dataset root (default: folder).")
-    ap.add_argument('--grid', type=str, default='default',
-                    help="grid: 'default' | 'smoke' | path to JSON")
+                    help='root for ImageNet (folder or ILSVRC/).')
+    ap.add_argument('--imagenet_layout', type=str, default='folder', choices=['folder','cls-loc'])
+    ap.add_argument('--grid', type=str, default='default')
     ap.add_argument('--epochs', type=int, default=300)
     ap.add_argument('--warmup', type=int, default=5)
     ap.add_argument('--bs', type=int, default=256)
-    ap.add_argument('--accum', type=int, default=1, help='gradient accumulation steps')
-    ap.add_argument('--workers', type=int, default=None,
-                    help='num dataloader workers (default: 0 on Windows, 8 otherwise)')
-    ap.add_argument('--prefetch', type=int, default=6,
-                    help='DataLoader prefetch_factor')
-    ap.add_argument('--drop_last', action='store_true',
-                    help='drop last batch in train loader')
-    ap.add_argument('--val_every', type=int, default=1,
-                    help='validate every N epochs (1 = every epoch)')
+    ap.add_argument('--accum', type=int, default=1)
+    ap.add_argument('--workers', type=int, default=None)
+    ap.add_argument('--prefetch', type=int, default=6)
+    ap.add_argument('--drop_last', action='store_true')
+    ap.add_argument('--val_every', type=int, default=1)
     ap.add_argument('--lr', type=float, default=5e-4)
     ap.add_argument('--wd', type=float, default=0.05)
-    ap.add_argument('--clip', type=float, default=1.0, help='grad-norm clip (0 disables)')
+    ap.add_argument('--clip', type=float, default=1.0)
     ap.add_argument('--label_smoothing', type=float, default=0.1)
     ap.add_argument('--no_amp', action='store_true')
-    ap.add_argument('--amp_dtype', type=str, default='bf16',
-                    choices=['bf16', 'fp16', 'fp32'],
-                    help='autocast dtype (Hopper: bf16 is recommended)')
-    # data aug
-    ap.add_argument('--randaug_n', type=int, default=2, help='RandAugment ops')
-    ap.add_argument('--randaug_m', type=int, default=9, help='RandAugment magnitude')
-    ap.add_argument('--random_erase', type=float, default=0.25, help='RandomErasing prob (0 to disable)')
-    # mixup / cutmix
-    ap.add_argument('--mixup', type=float, default=0.2, help='mixup alpha (0 to disable)')
-    ap.add_argument('--cutmix', type=float, default=1.0, help='cutmix alpha (0 to disable)')
-    ap.add_argument('--mix_prob', type=float, default=1.0, help='probability to apply mixup/cutmix to a batch')
-    # model tweaks
-    ap.add_argument('--drop_path', type=float, default=0.1, help='stochastic depth rate')
-    ap.add_argument('--grad_ckpt', action='store_true', help='enable gradient checkpointing if supported')
-    ap.add_argument('--layer_decay', type=float, default=0.75, help='layer-wise LR decay (e.g., 0.75)')
+    ap.add_argument('--amp_dtype', type=str, default='bf16', choices=['bf16', 'fp16', 'fp32'])
+    # aug
+    ap.add_argument('--randaug_n', type=int, default=2)
+    ap.add_argument('--randaug_m', type=int, default=9)
+    ap.add_argument('--random_erase', type=float, default=0.25)
+    # mixup/cutmix
+    ap.add_argument('--mixup', type=float, default=0.2)
+    ap.add_argument('--cutmix', type=float, default=1.0)
+    ap.add_argument('--mix_prob', type=float, default=1.0)
+    # model
+    ap.add_argument('--drop_path', type=float, default=0.1)
+    ap.add_argument('--grad_ckpt', action='store_true')
+    ap.add_argument('--layer_decay', type=float, default=0.75)
     # rope / ema
-    ap.add_argument('--rope', type=str, default='2d', choices=['none', '1d', '2d'], help='rotary pos. embedding')
-    ap.add_argument('--rope_theta', type=float, default=10000.0, help='theta for RoPE frequency base')
+    ap.add_argument('--rope', type=str, default='2d', choices=['none', '1d', '2d'])
+    ap.add_argument('--rope_theta', type=float, default=10000.0)
     group_ema = ap.add_mutually_exclusive_group()
-    group_ema.add_argument('--ema', dest='ema', action='store_true', help='use EMA of weights')
-    group_ema.add_argument('--no_ema', dest='ema', action='store_false', help='disable EMA')
+    group_ema.add_argument('--ema', dest='ema', action='store_true')
+    group_ema.add_argument('--no_ema', dest='ema', action='store_false')
     ap.set_defaults(ema=True)
-    ap.add_argument('--ema_decay', type=float, default=0.9999, help='EMA decay')
-    ap.add_argument('--ema_warmup', type=int, default=2000, help='EMA warmup steps (per update)')
-    ap.add_argument('--assign_once', action='store_true',
-                    help='compute est flops with assignment once (budgets only)')
+    ap.add_argument('--ema_decay', type=float, default=0.9997, help='per-step ema decay (suggest 0.999–0.9999)')
+    ap.add_argument('--ema_warmup', type=int, default=2000, help='updates to ramp 0→decay')
+    ap.add_argument('--assign_once', action='store_true')
     ap.add_argument('--device', type=str, default='cuda')
     ap.add_argument('--seed', type=int, default=1337)
     ap.add_argument('--deterministic', action='store_true')
     ap.add_argument('--out_dir', type=str, default=f'runs/exp_{now_utc()}')
-    ap.add_argument('--skip_train', action='store_true',
-                    help='only compute budgets, skip training')
-    ap.add_argument('--save_every', type=int, default=1, help='save checkpoint every N epochs')
-    ap.add_argument('--keep_snapshots', action='store_true',
-                    help='also save ckpt_eXXX.pt per epoch (disk heavy)')
-    ap.add_argument('--resume', type=str, default=None,
-                    help='path/to/ckpt_last.pt to resume (manual)')
-    ap.add_argument('--resume_auto', action='store_true',
-                    help='auto resume per-config if its ckpt_last.pt exists')
-    # DDP (optional; use torchrun)
-    ap.add_argument('--ddp', action='store_true', help='enable DDP if launched with torchrun')
-    ap.add_argument('--ddp_backend', type=str, default='nccl', help='nccl|gloo')
-    # MLflow
-    ap.add_argument('--mlflow', action='store_true', help='enable MLflow logging if installed')
+    ap.add_argument('--skip_train', action='store_true')
+    ap.add_argument('--save_every', type=int, default=1)
+    ap.add_argument('--keep_snapshots', action='store_true')
+    ap.add_argument('--resume', type=str, default=None)
+    ap.add_argument('--resume_auto', action='store_true')
+    # ddp
+    ap.add_argument('--ddp', action='store_true')
+    ap.add_argument('--ddp_backend', type=str, default='nccl')
+    # mlflow
+    ap.add_argument('--mlflow', action='store_true')
     ap.add_argument('--mlflow_exp', type=str, default='CDE-ViT')
     ap.add_argument('--mlflow_run', type=str, default=None)
-    # Performance toggles
-    ap.add_argument('--fused_adamw', action='store_true',
-                    help='use fused AdamW (PyTorch 2.x, CUDA only)')
-    ap.add_argument('--compile_mode', type=str, default='none',
-                    choices=['none', 'reduce-overhead', 'max-autotune'],
-                    help='torch.compile mode')
-    ap.add_argument('--sdp', type=str, default='flash',
-                    choices=['auto', 'flash', 'mem_efficient', 'math'],
-                    help='Scaled-Dot-Product-Attention backend preference')
+    # perf
+    ap.add_argument('--fused_adamw', action='store_true')
+    ap.add_argument('--compile_mode', type=str, default='none', choices=['none', 'reduce-overhead', 'max-autotune'])
+    ap.add_argument('--sdp', type=str, default='flash', choices=['auto', 'flash', 'mem_efficient', 'math'])
     args = ap.parse_args()
 
-    # rank/world detection
     rank = int(os.environ.get("RANK", "0"))
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
     ddp_active = args.ddp and world_size > 1
-
     if ddp_active:
         torch.distributed.init_process_group(backend=args.ddp_backend)
         torch.cuda.set_device(rank % max(1, torch.cuda.device_count()))
 
-    # seed & device
     set_seed(args.seed, deterministic=args.deterministic)
     device = torch.device(args.device if torch.cuda.is_available() else 'cpu')
 
-    # i/o
     out_dir = Path(args.out_dir)
     ensure_dir(out_dir)
     (out_dir / "meta").mkdir(exist_ok=True, parents=True)
-
-    # persist config
     if rank == 0:
         with open(out_dir / "meta" / "args.json", "w") as f:
             json.dump(vars(args), f, indent=2)
 
-    # dataset sanity
     assert_imagenet_root(args.imagenet, layout=args.imagenet_layout)
-
-    # grid
     grid = load_grid(args.grid)
 
-    # mlflow parent run
     run_name = args.mlflow_run or f"{Path(__file__).stem}-{now_utc()}"
     mlf = MLflowLogger(args.mlflow and (rank == 0), args.mlflow_exp, run_name,
                        tags={"host": os.uname().nodename if hasattr(os, "uname") else "win",
-                             "grid": args.grid,
-                             "imagenet_layout": args.imagenet_layout})
+                             "grid": args.grid, "imagenet_layout": args.imagenet_layout})
 
     rows: List[dict] = []
-
-    # ---- SDPA backend context (new API or legacy fallback) ----
     backend_ctx = set_sdpa_backend(args.sdp)
 
     try:
         with backend_ctx:
-            # data
             train_loader, val_loader, num_classes = make_imagenet_loaders(
                 args.imagenet, args.bs, workers=args.workers, size=224,
                 ddp=ddp_active, rank=rank, world_size=world_size,
                 layout=args.imagenet_layout, prefetch=args.prefetch,
-                drop_last=args.drop_last,
-                randaug_n=args.randaug_n, randaug_m=args.randaug_m,
+                drop_last=args.drop_last, randaug_n=args.randaug_n, randaug_m=args.randaug_m,
                 random_erase=args.random_erase
             )
 
             if rank == 0:
                 mlf.log_params({
                     "epochs": args.epochs, "warmup": args.warmup,
-                    "bs": args.bs, "accum": args.accum, "workers": (0 if args.workers is None and os.name=="nt" else (args.workers or 8)),
+                    "bs": args.bs, "accum": args.accum,
+                    "workers": (0 if args.workers is None and os.name=="nt" else (args.workers or 8)),
                     "lr": args.lr, "wd": args.wd, "clip": args.clip, "label_smoothing": args.label_smoothing,
                     "amp": (not args.no_amp), "amp_dtype": args.amp_dtype,
                     "assign_once": args.assign_once, "num_classes": num_classes,
@@ -1396,35 +1169,24 @@ def main():
                     "layer_decay": args.layer_decay
                 })
 
-            # loss
-            ce = nn.CrossEntropyLoss(label_smoothing=args.label_smoothing).to(device)  # kept for non-soft-target path
+            ce = nn.CrossEntropyLoss(label_smoothing=args.label_smoothing).to(device)
 
             for j, cfg in enumerate(grid):
                 cfg_out = cfg_dir(out_dir, j, cfg)
                 if rank == 0:
                     ensure_dir(cfg_out)
-                    # persist cfg/budget placeholders early
                     with open(cfg_out / "cfg.json", "w") as f: json.dump(asdict(cfg), f, indent=2)
-
-                if rank == 0:
                     print(f'\n== experiment {j+1}/{len(grid)}: {cfg} => {cfg_out.name}\n', flush=True)
-
-                # nested MLflow run per-config
-                if rank == 0:
                     mlf.child(run_name=f"{j:02d}_{cfg_slug(cfg)}")
 
-                # model
-                model = build_model(cfg, num_classes=num_classes,
-                                    model_kwargs={"drop_path_rate": args.drop_path})
+                model = build_model(cfg, num_classes=num_classes, model_kwargs={"drop_path_rate": args.drop_path})
                 if args.rope != 'none':
                     attach_rope(model, theta=args.rope_theta, kind=args.rope)
-                    # prefer RoPE-only: disable learned absolute pos embed unless user keeps it
                     disable_abs_pos_embed(model, zero_weights=True)
                 model.to(device)
                 if torch.cuda.is_available():
                     model.to(memory_format=torch.channels_last)
 
-                # torch.compile (compile BEFORE DDP wrap)
                 if args.compile_mode != 'none':
                     mode = 'reduce-overhead' if args.compile_mode == 'reduce-overhead' else 'max-autotune'
                     try:
@@ -1443,14 +1205,11 @@ def main():
                                 output_device=rank % max(1, torch.cuda.device_count()),
                                 broadcast_buffers=False)
 
-                # budget (note: assign_once only valid when codebook is shared)
                 budget = compute_budget(model.module if ddp_active else model,
                                         cfg.gate, cfg.K, cfg.topk, cfg.d_g_mode,
                                         cfg.assign_once, share_codebook=cfg.share_codebook)
                 if rank == 0:
-                    print(f'params(M)={budget.params_m:.3f}  '
-                          f'est_total_GFLOPs={budget.est_gflops_total:.3f}  '
-                          f'overhead={budget.est_gflops_overhead:.3f}', flush=True)
+                    print(f'params(M)={budget.params_m:.3f}  est_total_GFLOPs={budget.est_gflops_total:.3f}  overhead={budget.est_gflops_overhead:.3f}', flush=True)
                     with open(cfg_out / "budget.json", "w") as f: json.dump(asdict(budget), f, indent=2)
                     mlf.log_params({
                         "cfg_gate": cfg.gate, "cfg_K": cfg.K, "cfg_topk": cfg.topk,
@@ -1461,7 +1220,6 @@ def main():
                         "GFLOPs_overhead": round(budget.est_gflops_overhead, 3),
                     })
 
-                # optim/sched/amp
                 param_groups = build_param_groups(model if not ddp_active else model.module,
                                                   args.wd, base_lr=args.lr, layer_decay=args.layer_decay)
                 opt = torch.optim.AdamW(
@@ -1476,13 +1234,12 @@ def main():
                     scaler = torch.amp.GradScaler('cuda', enabled=use_fp16_scaler)
                 except TypeError:
                     scaler = torch.cuda.amp.GradScaler(enabled=use_fp16_scaler)
-                # ema
+
                 ema = None
                 base_model_ref = (model.module if hasattr(model, "module") else model)
                 if args.ema and not ddp_active:
                     ema = ModelEMA(base_model_ref, decay=args.ema_decay, device=device, warmup=args.ema_warmup)
 
-                # resume?
                 start_epoch = 0
                 best_acc1 = float("-inf")
                 if args.resume:
@@ -1492,10 +1249,7 @@ def main():
                     if auto.is_file():
                         start_epoch, best_acc1 = load_checkpoint(str(auto), model, opt, sched, scaler, ema)
 
-                # training
-                acc1 = None
-                last_rel = None
-                best_rel = None
+                acc1 = last_rel = best_rel = None
                 acc1_ema = None
 
                 if not args.skip_train:
@@ -1517,9 +1271,8 @@ def main():
                         for i, (x, y) in enumerate(train_loader):
                             x = x.to(device, non_blocking=True).to(memory_format=torch.channels_last)
                             y = y.to(device, non_blocking=True)
-                            # soft targets path if any aug/smoothing enabled
+
                             use_soft = (args.mixup > 0.0) or (args.cutmix > 0.0) or (args.label_smoothing > 0.0)
-                            # apply mixup/cutmix with probability
                             if use_soft and (random.random() < max(0.0, min(1.0, args.mix_prob))):
                                 do_cutmix = (args.cutmix > 0.0) and (random.random() < 0.5)
                                 if do_cutmix:
@@ -1527,14 +1280,12 @@ def main():
                                 else:
                                     x_aug, t = apply_mixup(x, y, num_classes, args.mixup if args.mixup > 0.0 else 0.2)
                             else:
-                                x_aug, t = x, (one_hot(y, num_classes, smoothing=args.label_smoothing)
-                                               if use_soft else None)
+                                x_aug, t = x, (one_hot(y, num_classes, smoothing=args.label_smoothing) if use_soft else None)
+
                             with torch.amp.autocast(device_type='cuda', enabled=(not args.no_amp), dtype=amp_dtype):
                                 logits = model(x_aug)
-                                if t is None:
-                                    loss = ce(logits, y) / accum
-                                else:
-                                    loss = soft_cross_entropy(logits, t) / accum
+                                loss = (soft_cross_entropy(logits, t) if t is not None else ce(logits, y)) / accum
+
                             if use_fp16_scaler:
                                 scaler.scale(loss).backward()
                             else:
@@ -1546,8 +1297,7 @@ def main():
                                         scaler.unscale_(opt)
                                     nn.utils.clip_grad_norm_(model.parameters(), args.clip)
                                 if use_fp16_scaler:
-                                    scaler.step(opt)
-                                    scaler.update()
+                                    scaler.step(opt); scaler.update()
                                 else:
                                     opt.step()
                                 if ema is not None:
@@ -1557,24 +1307,20 @@ def main():
                             tot_loss += loss.item() * accum * x.size(0)
                             seen += x.size(0)
 
-                            # progress (rank 0)
                             if rank == 0 and (i + 1) % max(1, steps // 10) == 0:
-                                print(f'ep {ep+1}/{args.epochs} it {i+1}/{steps} '
-                                      f'loss {tot_loss/max(1,seen):.4f}', flush=True)
+                                print(f'ep {ep+1}/{args.epochs} it {i+1}/{steps} loss {tot_loss/max(1,seen):.4f}', flush=True)
 
                         sched.step()
                         dt = time.time() - t0
                         imgs_per_s = seen / max(1e-6, dt)
 
-                        # validate every N epochs (and on last)
                         do_val = ((ep + 1) % max(1, args.val_every) == 0) or (ep + 1 == args.epochs)
+                        ema_delta = None
                         if do_val:
                             acc1 = evaluate_top1(model, val_loader, device)
                             acc1_ema = None
-                            ema_delta = None
                             if ema is not None:
                                 acc1_ema = evaluate_top1(ema.module, val_loader, device)
-                                # small sanity metric: mean abs delta across float tensors
                                 with torch.no_grad():
                                     msd = _unwrap(model).state_dict()
                                     esd = ema.module.state_dict()
@@ -1587,42 +1333,29 @@ def main():
                                                 pass
                                     if diffs:
                                         ema_delta = sum(diffs) / len(diffs)
-                        else:
-                            acc1 = None
-                            acc1_ema = None
-                            ema_delta = None
 
                         if rank == 0:
                             max_mem = torch.cuda.max_memory_allocated(device) if torch.cuda.is_available() else 0
-                            acc_str = f"{acc1:.2f}%" if acc1 is not None else "NA"
-                            extra = f' ema_acc1={acc1_ema:.2f}%' if acc1_ema is not None else ""
+                            acc_str = f"{(acc1 if acc1 is not None else float('nan')):.2f}%"
+                            extra = f' ema_acc1={(acc1_ema if acc1_ema is not None else float("nan")):.2f}%' if ema is not None else ""
                             extra2 = (f' emaΔ={ema_delta:.6f}' if ema_delta is not None else "")
-                            print(f'epoch {ep+1}/{args.epochs} acc1={acc_str}{extra} '
-                                  f'loss={tot_loss/max(1,seen):.4f} '
-                                  f'time={dt:.1f}s ({imgs_per_s:.1f} img/s) '
+                            print(f'epoch {ep+1}/{args.epochs} acc1={acc_str}{(" " + extra) if extra else ""} '
+                                  f'loss={tot_loss/max(1,seen):.4f} time={dt:.1f}s ({imgs_per_s:.1f} img/s) '
                                   f'gpu_mem={sizeof_fmt(max_mem)}{(" " + extra2) if extra2 else ""}', flush=True)
-                            log_dict = {
-                                "loss": float(tot_loss/max(1,seen)),
-                                "imgs_per_s": float(imgs_per_s)
-                            }
-                            if acc1 is not None:
-                                log_dict["acc1"] = float(acc1)
-                            if acc1_ema is not None:
-                                log_dict["acc1_ema"] = float(acc1_ema)
-                            if ema_delta is not None:
-                                log_dict["ema_delta_mean_abs"] = float(ema_delta)
+
+                            log_dict = {"loss": float(tot_loss/max(1,seen)), "imgs_per_s": float(imgs_per_s)}
+                            if acc1 is not None: log_dict["acc1"] = float(acc1)
+                            if acc1_ema is not None: log_dict["acc1_ema"] = float(acc1_ema)
+                            if ema_delta is not None: log_dict["ema_delta_mean_abs"] = float(ema_delta)
                             mlf.log_metrics(log_dict, step=ep+1)
 
-                            # checkpoints (per-config)
                             is_save_epoch = ((ep + 1) % max(1, args.save_every) == 0) or (ep + 1 == args.epochs)
                             if is_save_epoch:
-                                # prefer ema for model selection if available
                                 score = acc1_ema if (acc1_ema is not None) else acc1
                                 is_best = False
                                 if (score is not None) and (score >= best_acc1):
                                     best_acc1 = score
                                     is_best = True
-
                                 base_state = {
                                     "epoch": ep + 1,
                                     "best_acc1": best_acc1 if best_acc1 != float("-inf") else None,
@@ -1642,16 +1375,11 @@ def main():
                                     snap = cfg_out / f"ckpt_e{ep+1:03d}_a{(acc1 if acc1 is not None else float('nan')):.2f}.pt"
                                     torch.save(base_state, snap)
 
-                    # metrics.json per-config
                     if rank == 0:
                         with open(cfg_out / "metrics.json", "w") as f:
-                            json.dump({
-                                "acc1_best": best_acc1 if best_acc1 != float("-inf") else None
-                            }, f, indent=2)
+                            json.dump({"acc1_best": best_acc1 if best_acc1 != float("-inf") else None}, f, indent=2)
 
-                # end of one config
                 if rank == 0:
-                    # in case of skip_train, derive rel paths if any existing
                     if last_rel is None and (cfg_out / "ckpt_last.pt").is_file():
                         last_rel = str((cfg_out / "ckpt_last.pt").relative_to(out_dir))
                     if best_rel is None and (cfg_out / "ckpt_best.pt").is_file():
@@ -1662,11 +1390,9 @@ def main():
                                        str(cfg_out.relative_to(out_dir)), last_rel, best_rel)
                     rows.append(row)
                     write_csv_and_latex(rows, out_dir, fname='results')
-                    # log artifacts (per-config dir)
                     mlf.log_artifacts(str(cfg_out))
                     mlf.end_child()
 
-                # --- FREE GPU MEMORY BETWEEN CONFIGS ---
                 try:
                     del model, opt, sched, scaler, ema
                     if torch.cuda.is_available():
@@ -1680,15 +1406,11 @@ def main():
             write_csv_and_latex(rows, out_dir, fname='results')
     finally:
         if rank == 0:
-            # final artifacts
-            try:
-                mlf.log_artifacts(str(out_dir))
-            except Exception:
-                pass
+            try: mlf.log_artifacts(str(out_dir))
+            except Exception: pass
             mlf.end()
         if args.ddp and world_size > 1:
             torch.distributed.destroy_process_group()
-
 
 if __name__ == '__main__':
     main()
