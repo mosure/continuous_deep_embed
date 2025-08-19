@@ -411,7 +411,7 @@ class AttentionWithRoPE(nn.Module):
         self.grid_size = tuple(grid_size) if (grid_size is not None) else None
         self._warned_fallback = False
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, attn_mask: Optional[torch.Tensor] = None, **kwargs) -> torch.Tensor:
         try:
             B, N, C = x.shape
             H = self.attn.num_heads
@@ -460,6 +460,19 @@ class AttentionWithRoPE(nn.Module):
                 q, k = _apply_rope(q, k, cos, sin)
 
             attn = (q @ k.transpose(-2, -1))
+            # ---- optional attention mask handling (bool or additive) ----
+            if attn_mask is not None:
+                mask = attn_mask
+                # normalize shapes to [B,1,N,N] or [1,1,N,N] for broadcast over heads
+                if mask.dim() == 2:          # [N, N]
+                    mask = mask.unsqueeze(0).unsqueeze(0)
+                elif mask.dim() == 3:        # [B, N, N]
+                    mask = mask.unsqueeze(1)
+                # else: assume [B, H|1, N, N] or broadcastable
+                if mask.dtype == torch.bool:
+                    attn = attn.masked_fill(mask, torch.finfo(attn.dtype).min)
+                else:
+                    attn = attn + mask
             attn = attn.softmax(dim=-1)
             if hasattr(self.attn, 'attn_drop') and self.attn.attn_drop is not None:
                 attn = self.attn.attn_drop(attn)
@@ -469,7 +482,8 @@ class AttentionWithRoPE(nn.Module):
                 x = self.attn.proj_drop(x)
             return x
         except Exception:
-            return self.attn(x)
+            # fall back to the original module, forwarding any provided mask
+            return self.attn(x, attn_mask=attn_mask)
 
 
 def attach_rope(vit: nn.Module, theta: float = 10000.0, kind: str = '1d'):
@@ -1414,7 +1428,10 @@ def main():
 
                 amp_dtype = _dtype_from_str(args.amp_dtype)
                 use_fp16_scaler = (amp_dtype == torch.float16) and (not args.no_amp)
-                scaler = torch.cuda.amp.GradScaler(enabled=use_fp16_scaler)
+                try:
+                    scaler = torch.amp.GradScaler('cuda', enabled=use_fp16_scaler)
+                except TypeError:
+                    scaler = torch.cuda.amp.GradScaler(enabled=use_fp16_scaler)
                 # ema
                 ema = None
                 base_model_ref = (model.module if hasattr(model, "module") else model)
