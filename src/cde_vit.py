@@ -410,6 +410,35 @@ class AttentionWithRoPE(nn.Module):
         # (H, W) of patch grid if known; used for 2d mapping
         self.grid_size = tuple(grid_size) if (grid_size is not None) else None
         self._warned_fallback = False
+        # simple caches to avoid rebuilding cos/sin every forward
+        self._cache_1d = {}   # key: (N, Hd, dtype, device) -> (cos, sin)
+        self._cache_2d = {}   # key: (GH, GW, Hd_half, dtype, device) -> (cos_full, sin_full)
+
+    def _get_1d_cos_sin(self, N, Hd, dtype, device):
+        key = (int(N), int(Hd), dtype, device)
+        if key not in self._cache_1d:
+            cos, sin = _rope_freqs(Hd, N, self.theta, device, dtype)
+            if N > 0:
+                cos, sin = self._get_1d_cos_sin(N, Hd, dtype, device)
+            self._cache_1d[key] = (cos, sin)
+        return self._cache_1d[key]
+
+    def _get_2d_cos_sin(self, GH, GW, N, Hd, dtype, device):
+        Hd_half = Hd // 2
+        key = (int(GH), int(GW), int(Hd_half), dtype, device)
+        if key not in self._cache_2d:
+            cos_w, sin_w = _rope_freqs(Hd_half, GW, self.theta, device, dtype)
+            cos_h, sin_h = _rope_freqs(Hd_half, GH, self.theta, device, dtype)
+            rr = torch.arange(GH, device=device).unsqueeze(1).expand(GH, GW).reshape(-1)
+            cc = torch.arange(GW, device=device).unsqueeze(0).expand(GH, GW).reshape(-1)
+            cos_full = torch.ones((N, Hd), device=device, dtype=dtype)
+            sin_full = torch.zeros((N, Hd), device=device, dtype=dtype)
+            cos_full[1:, :Hd_half] = cos_w[cc]
+            cos_full[1:, Hd_half:] = cos_h[rr]
+            sin_full[1:, :Hd_half] = sin_w[cc]
+            sin_full[1:, Hd_half:] = sin_h[rr]
+            self._cache_2d[key] = (cos_full, sin_full)
+        return self._cache_2d[key]
 
     def forward(self, x: torch.Tensor, attn_mask: Optional[torch.Tensor] = None, **kwargs) -> torch.Tensor:
         try:
@@ -432,25 +461,13 @@ class AttentionWithRoPE(nn.Module):
                     if s * s == L:
                         GH, GW = s, s
                 if (GH is not None) and (GW is not None) and (GH * GW == L):
-                    # split dims: first half = x/cols, second half = y/rows
-                    Hd_half = Hd // 2
-                    cos_w, sin_w = _rope_freqs(Hd_half, GW, self.theta, device, dtype)  # per-col
-                    cos_h, sin_h = _rope_freqs(Hd_half, GH, self.theta, device, dtype)  # per-row
-                    rr = torch.arange(GH, device=device).unsqueeze(1).expand(GH, GW).reshape(-1)  # [L]
-                    cc = torch.arange(GW, device=device).unsqueeze(0).expand(GH, GW).reshape(-1)  # [L]
-                    cos_full = torch.ones((N, Hd), device=device, dtype=dtype)
-                    sin_full = torch.zeros((N, Hd), device=device, dtype=dtype)
-                    cos_full[1:, :Hd_half] = cos_w[cc]
-                    cos_full[1:, Hd_half:] = cos_h[rr]
-                    sin_full[1:, :Hd_half] = sin_w[cc]
-                    sin_full[1:, Hd_half:] = sin_h[rr]
+                    cos_full, sin_full = self._get_2d_cos_sin(GH, GW, N, Hd, dtype, device)
                     q, k = _apply_rope(q, k, cos_full, sin_full)
                 else:
                     if not self._warned_fallback:
                         print("[rope] 2d grid inference failed; falling back to 1d.", flush=True)
                         self._warned_fallback = True
-                    cos, sin = _rope_freqs(Hd, N, self.theta, device, dtype)
-                    cos[0].fill_(1.0); sin[0].zero_()
+                    cos, sin = self._get_1d_cos_sin(N, Hd, dtype, device)
                     q, k = _apply_rope(q, k, cos, sin)
             else:
                 cos, sin = _rope_freqs(Hd, N, self.theta, device, dtype)            # [N,Hd]
@@ -459,24 +476,11 @@ class AttentionWithRoPE(nn.Module):
                     cos[0].fill_(1.0); sin[0].zero_()
                 q, k = _apply_rope(q, k, cos, sin)
 
-            attn = (q @ k.transpose(-2, -1))
-            # ---- optional attention mask handling (bool or additive) ----
-            if attn_mask is not None:
-                mask = attn_mask
-                # normalize shapes to [B,1,N,N] or [1,1,N,N] for broadcast over heads
-                if mask.dim() == 2:          # [N, N]
-                    mask = mask.unsqueeze(0).unsqueeze(0)
-                elif mask.dim() == 3:        # [B, N, N]
-                    mask = mask.unsqueeze(1)
-                # else: assume [B, H|1, N, N] or broadcastable
-                if mask.dtype == torch.bool:
-                    attn = attn.masked_fill(mask, torch.finfo(attn.dtype).min)
-                else:
-                    attn = attn + mask
-            attn = attn.softmax(dim=-1)
-            if hasattr(self.attn, 'attn_drop') and self.attn.attn_drop is not None:
-                attn = self.attn.attn_drop(attn)
-            x = (attn @ v).transpose(1, 2).reshape(B, N, C)
+            # ---- SDPA / FlashAttention path (fast) ----
+            drop_p = float(getattr(getattr(self.attn, 'attn_drop', None), 'p', 0.0)) if self.training else 0.0
+            x = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask,
+                                               dropout_p=drop_p, is_causal=False)
+            x = x.transpose(1, 2).reshape(B, N, C)
             x = self.attn.proj(x)
             if hasattr(self.attn, 'proj_drop') and self.attn.proj_drop is not None:
                 x = self.attn.proj_drop(x)
