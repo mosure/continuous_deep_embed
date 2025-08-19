@@ -1,13 +1,21 @@
 # vit_s_continuous_deep_embed_experiments.py
 # ViT‑S/16 + Continuous Deep‑Embed (CDE) experimental harness
-# - Per‑config checkpoints (best/last) in dedicated subdirs
-# - Manifest CSV/LaTeX with checkpoint paths
-# - MLflow logging (grid parent + per‑config nested runs)
-# - Robust training: TF32, channels_last, grad accumulation, warmup‑cosine
-# - Windows-friendly DataLoader defaults; suppresses noisy third‑party logs
-# - Kaggle CLS-LOC layout support (--imagenet_layout cls-loc)
-# - Performance flags: bf16/fp16 autocast, fused AdamW, Flash SDPA, torch.compile,
-#   DataLoader prefetch/drop_last
+# - per‑config checkpoints (best/last) in dedicated subdirs
+# - manifest CSV/LaTeX with checkpoint paths
+# - mlflow logging (grid parent + per‑config nested runs)
+# - robust training: tf32, channels_last, grad accumulation, warmup‑cosine
+# - windows-friendly dataloader defaults; suppresses noisy third‑party logs
+# - kaggle cls-loc layout support (--imagenet_layout cls-loc)
+# - performance flags: bf16/fp16 autocast, fused adamw, flash sdpa, torch.compile,
+#   dataloader prefetch/drop_last
+# - upgrades for a stronger baseline:
+#   rotary positional embeddings (rope, true 2d by default; 1d fallback if needed)
+#   randaugment + random erasing
+#   mixup / cutmix + soft-target cross-entropy
+#   stochastic depth (drop_path)
+#   model ema (on by default; best checkpoint selection prefers ema acc)
+#   layer-wise lr decay (llrd)
+#   optional grad checkpointing
 
 # --- tame noisy third-party import logs (OpenVINO, HF telemetry) ---
 import os, warnings
@@ -28,6 +36,7 @@ import datetime as _dt
 from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import List, Optional, Tuple, Dict, Any
+import copy
 
 import torch
 import torch.nn as nn
@@ -354,6 +363,140 @@ def attach_gates(
             blk.mlp = MlpWithGateWidth(blk.mlp, gate)
 
 
+# ----------------------- attention: RoPE (rotary) ------------------------
+
+def _rope_freqs(head_dim: int, seq_len: int, theta: float, device, dtype):
+    """Classic 1D RoPE cache. Returns cos/sin with shape [seq_len, head_dim]."""
+    assert head_dim % 2 == 0, "head_dim must be even for RoPE"
+    inv_freq = 1.0 / (theta ** (torch.arange(0, head_dim, 2, device=device, dtype=torch.float32) / head_dim))
+    t = torch.arange(seq_len, device=device, dtype=torch.float32)  # [seq_len]
+    freqs = torch.einsum('n,d->nd', t, inv_freq)                   # [seq_len, head_dim/2]
+    cos = torch.cos(freqs).to(dtype).repeat_interleave(2, dim=-1)  # [seq_len, head_dim]
+    sin = torch.sin(freqs).to(dtype).repeat_interleave(2, dim=-1)
+    return cos, sin
+
+
+def _rope_rotate_half(x: torch.Tensor) -> torch.Tensor:
+    # x: [..., head_dim] with even head_dim
+    x1 = x[..., ::2]
+    x2 = x[..., 1::2]
+    out = torch.stack((-x2, x1), dim=-1)
+    return out.flatten(-2)
+
+
+def _apply_rope(q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor):
+    """
+    q, k: [B, H, N, Hd], cos/sin: [N, Hd]
+    returns rotated q, k with broadcasting over batch & heads.
+    """
+    cos = cos.unsqueeze(0).unsqueeze(0)  # [1,1,N,Hd]
+    sin = sin.unsqueeze(0).unsqueeze(0)
+    q_rot = (q * cos) + (_rope_rotate_half(q) * sin)
+    k_rot = (k * cos) + (_rope_rotate_half(k) * sin)
+    return q_rot, k_rot
+
+
+class AttentionWithRoPE(nn.Module):
+    """
+    wrap timm attention and apply 1d or 2d RoPE to q & k.
+    if grid inference fails in 2d mode, we fall back to 1d once.
+    """
+    def __init__(self, attn: nn.Module, theta: float = 10000.0, kind: str = '1d',
+                 grid_size: Optional[Tuple[int,int]] = None):
+        super().__init__()
+        self.attn = attn
+        self.theta = float(theta)
+        self.kind = kind if kind in ('1d', '2d') else '1d'
+        # (H, W) of patch grid if known; used for 2d mapping
+        self.grid_size = tuple(grid_size) if (grid_size is not None) else None
+        self._warned_fallback = False
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        try:
+            B, N, C = x.shape
+            H = self.attn.num_heads
+            Hd = C // H
+            qkv = self.attn.qkv(x).reshape(B, N, 3, H, Hd).permute(2, 0, 3, 1, 4)  # 3,B,H,N,Hd
+            q, k, v = qkv[0], qkv[1], qkv[2]                                        # B,H,N,Hd
+            q = q * getattr(self.attn, 'scale', (Hd ** -0.5))
+
+            device, dtype = q.device, q.dtype
+            # build cos/sin per position
+            if self.kind == '2d' and N > 1 and (Hd % 2 == 0):
+                L = N - 1  # exclude cls
+                GH = GW = None
+                if self.grid_size is not None:
+                    GH, GW = int(self.grid_size[0]), int(self.grid_size[1])
+                if (GH is None) or (GW is None) or (GH * GW != L):
+                    s = int(math.sqrt(L))
+                    if s * s == L:
+                        GH, GW = s, s
+                if (GH is not None) and (GW is not None) and (GH * GW == L):
+                    # split dims: first half = x/cols, second half = y/rows
+                    Hd_half = Hd // 2
+                    cos_w, sin_w = _rope_freqs(Hd_half, GW, self.theta, device, dtype)  # per-col
+                    cos_h, sin_h = _rope_freqs(Hd_half, GH, self.theta, device, dtype)  # per-row
+                    rr = torch.arange(GH, device=device).unsqueeze(1).expand(GH, GW).reshape(-1)  # [L]
+                    cc = torch.arange(GW, device=device).unsqueeze(0).expand(GH, GW).reshape(-1)  # [L]
+                    cos_full = torch.ones((N, Hd), device=device, dtype=dtype)
+                    sin_full = torch.zeros((N, Hd), device=device, dtype=dtype)
+                    cos_full[1:, :Hd_half] = cos_w[cc]
+                    cos_full[1:, Hd_half:] = cos_h[rr]
+                    sin_full[1:, :Hd_half] = sin_w[cc]
+                    sin_full[1:, Hd_half:] = sin_h[rr]
+                    q, k = _apply_rope(q, k, cos_full, sin_full)
+                else:
+                    if not self._warned_fallback:
+                        print("[rope] 2d grid inference failed; falling back to 1d.", flush=True)
+                        self._warned_fallback = True
+                    cos, sin = _rope_freqs(Hd, N, self.theta, device, dtype)
+                    cos[0].fill_(1.0); sin[0].zero_()
+                    q, k = _apply_rope(q, k, cos, sin)
+            else:
+                cos, sin = _rope_freqs(Hd, N, self.theta, device, dtype)            # [N,Hd]
+                if N > 0:
+                    cos = cos.clone(); sin = sin.clone()
+                    cos[0].fill_(1.0); sin[0].zero_()
+                q, k = _apply_rope(q, k, cos, sin)
+
+            attn = (q @ k.transpose(-2, -1))
+            attn = attn.softmax(dim=-1)
+            if hasattr(self.attn, 'attn_drop') and self.attn.attn_drop is not None:
+                attn = self.attn.attn_drop(attn)
+            x = (attn @ v).transpose(1, 2).reshape(B, N, C)
+            x = self.attn.proj(x)
+            if hasattr(self.attn, 'proj_drop') and self.attn.proj_drop is not None:
+                x = self.attn.proj_drop(x)
+            return x
+        except Exception:
+            return self.attn(x)
+
+
+def attach_rope(vit: nn.Module, theta: float = 10000.0, kind: str = '1d'):
+    """replace each block.attn by an AttentionWithRoPE wrapper (passes patch grid)."""
+    grid = None
+    try:
+        pe = getattr(vit, 'patch_embed', None)
+        gs = getattr(pe, 'grid_size', None)
+        if gs is not None:
+            grid = (int(gs[0]), int(gs[1]))
+    except Exception:
+        grid = None
+    for li, blk in enumerate(getattr(vit, 'blocks', [])):
+        if hasattr(blk, 'attn') and isinstance(blk.attn, nn.Module):
+            blk.attn = AttentionWithRoPE(blk.attn, theta=theta, kind=kind, grid_size=grid)
+
+
+def disable_abs_pos_embed(vit: nn.Module, zero_weights: bool = True):
+    """Disable learned absolute pos embed (recommended with RoPE)."""
+    pe = getattr(vit, 'pos_embed', None)
+    if isinstance(pe, torch.nn.Parameter):
+        if zero_weights:
+            with torch.no_grad():
+                pe.data.zero_()
+        pe.requires_grad_(False)
+
+
 # ----------------------- accounting --------------------------------------
 
 BASELINE_GFLOPS_DEIT_S_224 = 4.6  # reported (MAC-based)
@@ -390,7 +533,6 @@ def estimate_gate_overhead_gflops(
 def _infer_d_g(model: nn.Module, d_g_mode: str) -> int:
     if d_g_mode != 'expand':
         return int(model.embed_dim)
-    # after wrapping, the mlp may be a wrapper; use robust inference
     try:
         mlp0 = model.blocks[0].mlp
         return _infer_hidden_dim_from_mlp(mlp0, fallback=4 * model.embed_dim)
@@ -412,7 +554,6 @@ def compute_budget(
     L = len(model.blocks)
     d_g = _infer_d_g(model, d_g_mode)
     k = 1 if gate == 'vq' else (topk or K)
-    # If codebook is per-layer, assignment must be per-layer
     eff_assign_once = assign_once and share_codebook
     overhead = 0.0 if gate == 'none' else estimate_gate_overhead_gflops(
         K, d_in, d_g, tokens, L, k, assign_once=eff_assign_once
@@ -467,7 +608,6 @@ class ImageNetClsLoc(Dataset):
             class_dirs = [p for p in train_dir.iterdir() if p.is_dir()]
             self.classes = sorted([p.name for p in class_dirs])
             self.class_to_idx = {c: i for i, c in enumerate(self.classes)}
-            # enumerate flat images, map via XML -> wnid
             imgs = sorted([p for p in self.data_dir.iterdir() if p.suffix in self.IMG_EXTS])
             samples = []
             miss_xml = 0
@@ -522,18 +662,31 @@ def make_imagenet_loaders(
     layout: str = "folder",   # existing
     prefetch: int = 6,        # NEW
     drop_last: bool = False,  # NEW
+    randaug_n: int = 2,
+    randaug_m: int = 9,
+    random_erase: float = 0.25,
 ):
     """Create loaders; on Windows, default to workers=0 to avoid spawn spam unless user overrides."""
     if workers is None:
         workers = 0 if os.name == "nt" else min(8, os.cpu_count() or 8)
 
-    train_tf = transforms.Compose([
+    ra = transforms.RandAugment(num_ops=randaug_n, magnitude=randaug_m) if randaug_n > 0 else None
+    re = transforms.RandomErasing(p=random_erase, value='random') if random_erase and random_erase > 0 else None
+    train_ops = [
         transforms.RandomResizedCrop(size, scale=(0.08, 1.0),
                                      interpolation=transforms.InterpolationMode.BICUBIC),
         transforms.RandomHorizontalFlip(),
+    ]
+    if ra is not None:
+        train_ops.append(ra)
+    train_ops += [
         transforms.ToTensor(),
         transforms.Normalize(IMAGENET_MEAN, IMAGENET_STD),
-    ])
+    ]
+    if re is not None:
+        train_ops.append(re)
+    train_tf = transforms.Compose(train_ops)
+
     val_tf = transforms.Compose([
         transforms.Resize(int(size * 256 / 224),
                           interpolation=transforms.InterpolationMode.BICUBIC),
@@ -602,19 +755,45 @@ class WarmupCosine(torch.optim.lr_scheduler._LRScheduler):
         return [base_lr * cos for base_lr in self.base_lrs]
 
 
-def build_param_groups(model: nn.Module, weight_decay: float) -> List[Dict[str, Any]]:
-    """AdamW param groups with no weight decay for biases/LayerNorms."""
-    decay, no_decay = [], []
+def build_param_groups(model: nn.Module, weight_decay: float,
+                       base_lr: Optional[float] = None, layer_decay: float = 1.0) -> List[Dict[str, Any]]:
+    """AdamW param groups with (optional) LLRD; no weight decay for biases/LayerNorms."""
+    if (base_lr is None) or (layer_decay >= 0.9999):
+        decay, no_decay = [], []
+        for n, p in model.named_parameters():
+            if not p.requires_grad: continue
+            if n.endswith(".bias") or "norm" in n.lower():
+                no_decay.append(p)
+            else:
+                decay.append(p)
+        return [
+            {"params": decay, "weight_decay": weight_decay},
+            {"params": no_decay, "weight_decay": 0.0},
+        ]
+    # layer-wise lr decay
+    num_layers = (len(getattr(model, "blocks", [])) if hasattr(model, "blocks") else 0) + 2  # embed..blocks..head
+    def _layer_id(name: str) -> int:
+        if name.startswith("patch_embed") or ("pos_embed" in name) or ("cls_token" in name):
+            return 0
+        if name.startswith("blocks."):
+            try:
+                lid = int(name.split(".")[1])
+            except Exception:
+                lid = 0
+            return lid + 1
+        return num_layers - 1
+    groups: Dict[Tuple[float, float], Dict[str, Any]] = {}
     for n, p in model.named_parameters():
         if not p.requires_grad: continue
-        if n.endswith(".bias") or "norm" in n.lower():
-            no_decay.append(p)
-        else:
-            decay.append(p)
-    return [
-        {"params": decay, "weight_decay": weight_decay},
-        {"params": no_decay, "weight_decay": 0.0},
-    ]
+        lid = _layer_id(n)
+        scale = layer_decay ** (num_layers - 1 - lid)
+        lr = base_lr * scale
+        wd = 0.0 if (n.endswith(".bias") or "norm" in n.lower()) else weight_decay
+        key = (lr, wd)
+        if key not in groups:
+            groups[key] = {"params": [], "weight_decay": wd, "lr": lr}
+        groups[key]["params"].append(p)
+    return list(groups.values())
 
 
 @torch.no_grad()
@@ -629,6 +808,81 @@ def evaluate_top1(model: nn.Module, loader: DataLoader, device: torch.device) ->
         correct += (pred == y).sum().item()
         tot += y.numel()
     return 100.0 * correct / max(1, tot)
+
+
+# ----------------------- losses, aug, ema --------------------------------
+
+def one_hot(y: torch.Tensor, num_classes: int, smoothing: float = 0.0) -> torch.Tensor:
+    assert 0.0 <= smoothing < 1.0
+    with torch.no_grad():
+        y = y.view(-1)
+        off = smoothing / float(num_classes)
+        on = 1.0 - smoothing + off
+        out = torch.full((y.size(0), num_classes), off, device=y.device, dtype=torch.float32)
+        out.scatter_(1, y.unsqueeze(1), on)
+    return out
+
+
+def soft_cross_entropy(logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+    # logits: [B,C], targets: [B,C] (probabilities)
+    return (-targets * F.log_softmax(logits, dim=-1)).sum(dim=-1).mean()
+
+
+def _rand_bbox(w: int, h: int, lam: float):
+    cut_rat = math.sqrt(1.0 - lam)
+    cut_w = int(w * cut_rat)
+    cut_h = int(h * cut_rat)
+    cx = random.randint(0, w - 1)
+    cy = random.randint(0, h - 1)
+    x1 = max(cx - cut_w // 2, 0)
+    y1 = max(cy - cut_h // 2, 0)
+    x2 = min(cx + cut_w // 2, w)
+    y2 = min(cy + cut_h // 2, h)
+    return x1, y1, x2, y2
+
+
+def apply_mixup(x: torch.Tensor, y: torch.Tensor, num_classes: int, alpha: float):
+    if alpha <= 0.0:  # no-op
+        return x, one_hot(y, num_classes)
+    lam = torch.distributions.Beta(alpha, alpha).sample().item()
+    index = torch.randperm(x.size(0), device=x.device)
+    y1 = one_hot(y, num_classes)
+    y2 = y1[index]
+    x_m = lam * x + (1.0 - lam) * x[index]
+    t_m = lam * y1 + (1.0 - lam) * y2
+    return x_m, t_m
+
+
+def apply_cutmix(x: torch.Tensor, y: torch.Tensor, num_classes: int, alpha: float):
+    if alpha <= 0.0:
+        return x, one_hot(y, num_classes)
+    lam = torch.distributions.Beta(alpha, alpha).sample().item()
+    index = torch.randperm(x.size(0), device=x.device)
+    y1 = one_hot(y, num_classes)
+    y2 = y1[index]
+    B, C, H, W = x.shape
+    x1, y1b, x2, y2b = _rand_bbox(W, H, lam)
+    x_m = x.clone()
+    x_m[:, :, y1b:y2b, x1:x2] = x[index, :, y1b:y2b, x1:x2]
+    lam_adj = 1.0 - ((x2 - x1) * (y2b - y1b) / float(W * H))
+    t_m = lam_adj * one_hot(y, num_classes) + (1.0 - lam_adj) * y2
+    return x_m, t_m
+
+
+class ModelEMA(nn.Module):
+    """Exponential Moving Average of model parameters for evaluation stability."""
+    def __init__(self, model: nn.Module, decay: float = 0.9999):
+        super().__init__()
+        self.module = copy.deepcopy(model).eval()
+        for p in self.module.parameters():
+            p.requires_grad_(False)
+        self.decay = float(decay)
+
+    @torch.no_grad()
+    def update(self, model: nn.Module):
+        d = self.decay
+        for ema_p, p in zip(self.module.parameters(), model.parameters()):
+            ema_p.data.mul_(d).add_(p.data, alpha=(1.0 - d))
 
 
 # ----------------------- MLflow & checkpoints ----------------------------
@@ -725,10 +979,11 @@ class ExpCfg:
     share_E: bool = False        # True: one E across depth; False: per-layer E (default)
 
 
-def build_model(cfg: ExpCfg, num_classes: int = 1000) -> nn.Module:
+def build_model(cfg: ExpCfg, num_classes: int = 1000, model_kwargs: Optional[Dict[str, Any]] = None) -> nn.Module:
     if timm is None:
         raise RuntimeError("timm is required (pip install timm).")
-    model = timm.create_model('deit_small_patch16_224', pretrained=False, num_classes=num_classes)
+    mk = model_kwargs or {}
+    model = timm.create_model('deit_small_patch16_224', pretrained=False, num_classes=num_classes, **mk)
     if cfg.gate != 'none':
         attach_gates(
             model, kind=cfg.gate, K=cfg.K, d_g_mode=cfg.d_g_mode,
@@ -940,7 +1195,7 @@ def main():
                     help="Directory layout of the dataset root (default: folder).")
     ap.add_argument('--grid', type=str, default='default',
                     help="grid: 'default' | 'smoke' | path to JSON")
-    ap.add_argument('--epochs', type=int, default=100)
+    ap.add_argument('--epochs', type=int, default=300)
     ap.add_argument('--warmup', type=int, default=5)
     ap.add_argument('--bs', type=int, default=256)
     ap.add_argument('--accum', type=int, default=1, help='gradient accumulation steps')
@@ -955,11 +1210,31 @@ def main():
     ap.add_argument('--lr', type=float, default=5e-4)
     ap.add_argument('--wd', type=float, default=0.05)
     ap.add_argument('--clip', type=float, default=1.0, help='grad-norm clip (0 disables)')
-    ap.add_argument('--label_smoothing', type=float, default=0.0)
+    ap.add_argument('--label_smoothing', type=float, default=0.1)
     ap.add_argument('--no_amp', action='store_true')
     ap.add_argument('--amp_dtype', type=str, default='bf16',
                     choices=['bf16', 'fp16', 'fp32'],
                     help='autocast dtype (Hopper: bf16 is recommended)')
+    # data aug
+    ap.add_argument('--randaug_n', type=int, default=2, help='RandAugment ops')
+    ap.add_argument('--randaug_m', type=int, default=9, help='RandAugment magnitude')
+    ap.add_argument('--random_erase', type=float, default=0.25, help='RandomErasing prob (0 to disable)')
+    # mixup / cutmix
+    ap.add_argument('--mixup', type=float, default=0.2, help='mixup alpha (0 to disable)')
+    ap.add_argument('--cutmix', type=float, default=1.0, help='cutmix alpha (0 to disable)')
+    ap.add_argument('--mix_prob', type=float, default=1.0, help='probability to apply mixup/cutmix to a batch')
+    # model tweaks
+    ap.add_argument('--drop_path', type=float, default=0.1, help='stochastic depth rate')
+    ap.add_argument('--grad_ckpt', action='store_true', help='enable gradient checkpointing if supported')
+    ap.add_argument('--layer_decay', type=float, default=0.75, help='layer-wise LR decay (e.g., 0.75)')
+    # rope / ema
+    ap.add_argument('--rope', type=str, default='2d', choices=['none', '1d', '2d'], help='rotary pos. embedding')
+    ap.add_argument('--rope_theta', type=float, default=10000.0, help='theta for RoPE frequency base')
+    group_ema = ap.add_mutually_exclusive_group()
+    group_ema.add_argument('--ema', dest='ema', action='store_true', help='use EMA of weights')
+    group_ema.add_argument('--no_ema', dest='ema', action='store_false', help='disable EMA')
+    ap.set_defaults(ema=True)
+    ap.add_argument('--ema_decay', type=float, default=0.9999, help='EMA decay')
     ap.add_argument('--assign_once', action='store_true',
                     help='compute est flops with assignment once (budgets only)')
     ap.add_argument('--device', type=str, default='cuda')
@@ -1041,7 +1316,9 @@ def main():
                 args.imagenet, args.bs, workers=args.workers, size=224,
                 ddp=ddp_active, rank=rank, world_size=world_size,
                 layout=args.imagenet_layout, prefetch=args.prefetch,
-                drop_last=args.drop_last
+                drop_last=args.drop_last,
+                randaug_n=args.randaug_n, randaug_m=args.randaug_m,
+                random_erase=args.random_erase
             )
 
             if rank == 0:
@@ -1054,11 +1331,15 @@ def main():
                     "ddp": ddp_active, "world_size": world_size,
                     "prefetch": args.prefetch, "drop_last": args.drop_last,
                     "compile_mode": args.compile_mode, "sdp": args.sdp, "fused_adamw": args.fused_adamw,
-                    "val_every": args.val_every
+                    "val_every": args.val_every, "drop_path": args.drop_path,
+                    "randaug_n": args.randaug_n, "randaug_m": args.randaug_m, "random_erase": args.random_erase,
+                    "mixup": args.mixup, "cutmix": args.cutmix, "mix_prob": args.mix_prob,
+                    "rope": args.rope, "rope_theta": args.rope_theta, "ema": args.ema,
+                    "layer_decay": args.layer_decay
                 })
 
             # loss
-            ce = nn.CrossEntropyLoss(label_smoothing=args.label_smoothing).to(device)
+            ce = nn.CrossEntropyLoss(label_smoothing=args.label_smoothing).to(device)  # kept for non-soft-target path
 
             for j, cfg in enumerate(grid):
                 cfg_out = cfg_dir(out_dir, j, cfg)
@@ -1075,7 +1356,12 @@ def main():
                     mlf.child(run_name=f"{j:02d}_{cfg_slug(cfg)}")
 
                 # model
-                model = build_model(cfg, num_classes=num_classes)
+                model = build_model(cfg, num_classes=num_classes,
+                                    model_kwargs={"drop_path_rate": args.drop_path})
+                if args.rope != 'none':
+                    attach_rope(model, theta=args.rope_theta, kind=args.rope)
+                    # prefer RoPE-only: disable learned absolute pos embed unless user keeps it
+                    disable_abs_pos_embed(model, zero_weights=True)
                 model.to(device)
                 if torch.cuda.is_available():
                     model.to(memory_format=torch.channels_last)
@@ -1088,6 +1374,10 @@ def main():
                     except Exception as _e:
                         if rank == 0:
                             print(f"[warn] torch.compile failed: {_e}. Continuing without compile.", flush=True)
+
+                if args.grad_ckpt and hasattr(model, 'set_grad_checkpointing'):
+                    try: model.set_grad_checkpointing()
+                    except Exception: pass
 
                 if ddp_active:
                     from torch.nn.parallel import DistributedDataParallel as DDP
@@ -1114,7 +1404,8 @@ def main():
                     })
 
                 # optim/sched/amp
-                param_groups = build_param_groups(model, args.wd)
+                param_groups = build_param_groups(model if not ddp_active else model.module,
+                                                  args.wd, base_lr=args.lr, layer_decay=args.layer_decay)
                 opt = torch.optim.AdamW(
                     param_groups, lr=args.lr, betas=(0.9, 0.999),
                     fused=getattr(torch.optim.AdamW, 'fused', False) and args.fused_adamw
@@ -1124,6 +1415,11 @@ def main():
                 amp_dtype = _dtype_from_str(args.amp_dtype)
                 use_fp16_scaler = (amp_dtype == torch.float16) and (not args.no_amp)
                 scaler = torch.cuda.amp.GradScaler(enabled=use_fp16_scaler)
+                # ema
+                ema = None
+                base_model_ref = (model.module if hasattr(model, "module") else model)
+                if args.ema and not ddp_active:
+                    ema = ModelEMA(base_model_ref, decay=args.ema_decay)
 
                 # resume?
                 start_epoch = 0
@@ -1139,6 +1435,7 @@ def main():
                 acc1 = None
                 last_rel = None
                 best_rel = None
+                acc1_ema = None
 
                 if not args.skip_train:
                     for ep in range(start_epoch, args.epochs):
@@ -1159,9 +1456,24 @@ def main():
                         for i, (x, y) in enumerate(train_loader):
                             x = x.to(device, non_blocking=True).to(memory_format=torch.channels_last)
                             y = y.to(device, non_blocking=True)
+                            # soft targets path if any aug/smoothing enabled
+                            use_soft = (args.mixup > 0.0) or (args.cutmix > 0.0) or (args.label_smoothing > 0.0)
+                            # apply mixup/cutmix with probability
+                            if use_soft and (random.random() < max(0.0, min(1.0, args.mix_prob))):
+                                do_cutmix = (args.cutmix > 0.0) and (random.random() < 0.5)
+                                if do_cutmix:
+                                    x_aug, t = apply_cutmix(x, y, num_classes, args.cutmix)
+                                else:
+                                    x_aug, t = apply_mixup(x, y, num_classes, args.mixup if args.mixup > 0.0 else 0.2)
+                            else:
+                                x_aug, t = x, (one_hot(y, num_classes, smoothing=args.label_smoothing)
+                                               if use_soft else None)
                             with torch.amp.autocast(device_type='cuda', enabled=(not args.no_amp), dtype=amp_dtype):
-                                logits = model(x)
-                                loss = ce(logits, y) / accum
+                                logits = model(x_aug)
+                                if t is None:
+                                    loss = ce(logits, y) / accum
+                                else:
+                                    loss = soft_cross_entropy(logits, t) / accum
                             if use_fp16_scaler:
                                 scaler.scale(loss).backward()
                             else:
@@ -1177,6 +1489,8 @@ def main():
                                     scaler.update()
                                 else:
                                     opt.step()
+                                if ema is not None:
+                                    ema.update(model.module if hasattr(model, "module") else model)
                                 opt.zero_grad(set_to_none=True)
 
                             tot_loss += loss.item() * accum * x.size(0)
@@ -1195,13 +1509,18 @@ def main():
                         do_val = ((ep + 1) % max(1, args.val_every) == 0) or (ep + 1 == args.epochs)
                         if do_val:
                             acc1 = evaluate_top1(model, val_loader, device)
+                            acc1_ema = None
+                            if ema is not None:
+                                acc1_ema = evaluate_top1(ema.module, val_loader, device)
                         else:
                             acc1 = None
+                            acc1_ema = None
 
                         if rank == 0:
                             max_mem = torch.cuda.max_memory_allocated(device) if torch.cuda.is_available() else 0
                             acc_str = f"{acc1:.2f}%" if acc1 is not None else "NA"
-                            print(f'epoch {ep+1}/{args.epochs} acc1={acc_str} '
+                            extra = f' ema_acc1={acc1_ema:.2f}%' if acc1_ema is not None else ""
+                            print(f'epoch {ep+1}/{args.epochs} acc1={acc_str}{extra} '
                                   f'loss={tot_loss/max(1,seen):.4f} '
                                   f'time={dt:.1f}s ({imgs_per_s:.1f} img/s) '
                                   f'gpu_mem={sizeof_fmt(max_mem)}', flush=True)
@@ -1211,15 +1530,18 @@ def main():
                             }
                             if acc1 is not None:
                                 log_dict["acc1"] = float(acc1)
+                            if acc1_ema is not None:
+                                log_dict["acc1_ema"] = float(acc1_ema)
                             mlf.log_metrics(log_dict, step=ep+1)
 
                             # checkpoints (per-config)
                             is_save_epoch = ((ep + 1) % max(1, args.save_every) == 0) or (ep + 1 == args.epochs)
                             if is_save_epoch:
-                                # update best on validation epochs only
+                                # prefer ema for model selection if available
+                                score = acc1_ema if (acc1_ema is not None) else acc1
                                 is_best = False
-                                if acc1 is not None and acc1 >= best_acc1:
-                                    best_acc1 = acc1
+                                if (score is not None) and (score >= best_acc1):
+                                    best_acc1 = score
                                     is_best = True
 
                                 base_state = {
@@ -1229,6 +1551,7 @@ def main():
                                     "opt": opt.state_dict(),
                                     "sched": sched.state_dict(),
                                     "scaler": scaler.state_dict(),
+                                    "model_ema": (ema.module.state_dict() if ema is not None else None),
                                     "cfg": asdict(cfg),
                                     "args": vars(args)
                                 }
@@ -1266,7 +1589,7 @@ def main():
 
                 # --- FREE GPU MEMORY BETWEEN CONFIGS ---
                 try:
-                    del model, opt, sched, scaler
+                    del model, opt, sched, scaler, ema
                     if torch.cuda.is_available():
                         torch.cuda.empty_cache()
                 except Exception:
