@@ -419,7 +419,8 @@ class AttentionWithRoPE(nn.Module):
         if key not in self._cache_1d:
             cos, sin = _rope_freqs(Hd, N, self.theta, device, dtype)
             if N > 0:
-                cos, sin = self._get_1d_cos_sin(N, Hd, dtype, device)
+                cos = cos.clone(); sin = sin.clone()
+                cos[0].fill_(1.0); sin[0].zero_()
             self._cache_1d[key] = (cos, sin)
         return self._cache_1d[key]
 
@@ -470,10 +471,7 @@ class AttentionWithRoPE(nn.Module):
                     cos, sin = self._get_1d_cos_sin(N, Hd, dtype, device)
                     q, k = _apply_rope(q, k, cos, sin)
             else:
-                cos, sin = _rope_freqs(Hd, N, self.theta, device, dtype)            # [N,Hd]
-                if N > 0:
-                    cos = cos.clone(); sin = sin.clone()
-                    cos[0].fill_(1.0); sin[0].zero_()
+                cos, sin = self._get_1d_cos_sin(N, Hd, dtype, device)
                 q, k = _apply_rope(q, k, cos, sin)
 
             # ---- SDPA / FlashAttention path (fast) ----
@@ -887,20 +885,51 @@ def apply_cutmix(x: torch.Tensor, y: torch.Tensor, num_classes: int, alpha: floa
     return x_m, t_m
 
 
+def _unwrap(m):  # helper for DDP/no-DDP
+    return m.module if hasattr(m, "module") else m
+
+
 class ModelEMA(nn.Module):
-    """Exponential Moving Average of model parameters for evaluation stability."""
-    def __init__(self, model: nn.Module, decay: float = 0.9999):
+    """
+    Exponential Moving Average of model parameters (robust):
+    - updates by state_dict keys (no reliance on param order),
+    - copies non-float & 'running_*' buffers directly (keeps BN stats sane),
+    - optional short warmup so EMA catches up early.
+    """
+    def __init__(self, model: nn.Module, decay: float = 0.9997, device: Optional[torch.device] = None,
+                 warmup: int = 2000):
         super().__init__()
-        self.module = copy.deepcopy(model).eval()
+        self.module = copy.deepcopy(_unwrap(model)).eval()
         for p in self.module.parameters():
             p.requires_grad_(False)
-        self.decay = float(decay)
+        if device is not None:
+            self.module.to(device)
+        self.base_decay = float(decay)
+        self.warmup = int(max(0, warmup))
+        self.updates = 0
+
+    def _decay(self) -> float:
+        if self.updates < self.warmup:
+            t = self.updates
+            return 1.0 - (1.0 - self.base_decay) * (t + 1) / (self.warmup + 1)
+        return self.base_decay
 
     @torch.no_grad()
     def update(self, model: nn.Module):
-        d = self.decay
-        for ema_p, p in zip(self.module.parameters(), model.parameters()):
-            ema_p.data.mul_(d).add_(p.data, alpha=(1.0 - d))
+        self.updates += 1
+        d = self._decay()
+        msd = _unwrap(model).state_dict()
+        esd = self.module.state_dict()
+        for k, v in msd.items():
+            # copy integer & non-float buffers directly
+            if not hasattr(v, "dtype") or not v.dtype.is_floating_point:
+                esd[k].copy_(v)
+                continue
+            # keep 'running_*' buffers (e.g., BatchNorm stats) in sync exactly
+            if k.startswith('running_') or ('running_' in k) or k.endswith('num_batches_tracked'):
+                esd[k].copy_(v)
+            else:
+                esd[k].mul_(d).add_(v, alpha=1.0 - d)
 
 
 # ----------------------- MLflow & checkpoints ----------------------------
@@ -970,12 +999,21 @@ def save_checkpoint_pair(cfg_out: Path, state: Dict[str, Any], is_best: bool):
     return str(last_path), (str(cfg_out / "ckpt_best.pt") if is_best else None)
 
 
-def load_checkpoint(path: str, model: nn.Module, opt=None, sched=None, scaler=None) -> Tuple[int, float]:
+def load_checkpoint(path: str, model: nn.Module, opt=None, sched=None, scaler=None, ema: Optional[ModelEMA] = None) -> Tuple[int, float]:
     ckpt = torch.load(path, map_location="cpu")
-    model.load_state_dict(ckpt["model"], strict=True)
+    _unwrap(model).load_state_dict(ckpt["model"], strict=True)
     if opt and "opt" in ckpt: opt.load_state_dict(ckpt["opt"])
     if sched and "sched" in ckpt: sched.load_state_dict(ckpt["sched"])
-    if scaler and "scaler" in ckpt: scaler.load_state_dict(ckpt["scaler"])
+    if scaler and "scaler" in ckpt and ckpt["scaler"] is not None:
+        try:
+            scaler.load_state_dict(ckpt["scaler"])
+        except Exception:
+            pass
+    if ema is not None and "model_ema" in ckpt and ckpt["model_ema"] is not None:
+        try:
+            ema.module.load_state_dict(ckpt["model_ema"], strict=True)
+        except Exception as _e:
+            print(f"[resume] warning: failed to load EMA weights: {_e}", flush=True)
     start_epoch = ckpt.get("epoch", 0)
     best = ckpt.get("best_acc1", float("-inf"))
     print(f"[resume] loaded {path} (epoch={start_epoch}, best={best:.2f})")
@@ -1253,6 +1291,7 @@ def main():
     group_ema.add_argument('--no_ema', dest='ema', action='store_false', help='disable EMA')
     ap.set_defaults(ema=True)
     ap.add_argument('--ema_decay', type=float, default=0.9999, help='EMA decay')
+    ap.add_argument('--ema_warmup', type=int, default=2000, help='EMA warmup steps (per update)')
     ap.add_argument('--assign_once', action='store_true',
                     help='compute est flops with assignment once (budgets only)')
     ap.add_argument('--device', type=str, default='cuda')
@@ -1353,6 +1392,7 @@ def main():
                     "randaug_n": args.randaug_n, "randaug_m": args.randaug_m, "random_erase": args.random_erase,
                     "mixup": args.mixup, "cutmix": args.cutmix, "mix_prob": args.mix_prob,
                     "rope": args.rope, "rope_theta": args.rope_theta, "ema": args.ema,
+                    "ema_decay": args.ema_decay, "ema_warmup": args.ema_warmup,
                     "layer_decay": args.layer_decay
                 })
 
@@ -1440,17 +1480,17 @@ def main():
                 ema = None
                 base_model_ref = (model.module if hasattr(model, "module") else model)
                 if args.ema and not ddp_active:
-                    ema = ModelEMA(base_model_ref, decay=args.ema_decay)
+                    ema = ModelEMA(base_model_ref, decay=args.ema_decay, device=device, warmup=args.ema_warmup)
 
                 # resume?
                 start_epoch = 0
                 best_acc1 = float("-inf")
                 if args.resume:
-                    start_epoch, best_acc1 = load_checkpoint(args.resume, model, opt, sched, scaler)
+                    start_epoch, best_acc1 = load_checkpoint(args.resume, model, opt, sched, scaler, ema)
                 elif args.resume_auto:
                     auto = cfg_out / "ckpt_last.pt"
                     if auto.is_file():
-                        start_epoch, best_acc1 = load_checkpoint(str(auto), model, opt, sched, scaler)
+                        start_epoch, best_acc1 = load_checkpoint(str(auto), model, opt, sched, scaler, ema)
 
                 # training
                 acc1 = None
@@ -1531,20 +1571,36 @@ def main():
                         if do_val:
                             acc1 = evaluate_top1(model, val_loader, device)
                             acc1_ema = None
+                            ema_delta = None
                             if ema is not None:
                                 acc1_ema = evaluate_top1(ema.module, val_loader, device)
+                                # small sanity metric: mean abs delta across float tensors
+                                with torch.no_grad():
+                                    msd = _unwrap(model).state_dict()
+                                    esd = ema.module.state_dict()
+                                    diffs = []
+                                    for k, v in msd.items():
+                                        if hasattr(v, "dtype") and v.dtype.is_floating_point:
+                                            try:
+                                                diffs.append((v - esd[k]).abs().mean().item())
+                                            except Exception:
+                                                pass
+                                    if diffs:
+                                        ema_delta = sum(diffs) / len(diffs)
                         else:
                             acc1 = None
                             acc1_ema = None
+                            ema_delta = None
 
                         if rank == 0:
                             max_mem = torch.cuda.max_memory_allocated(device) if torch.cuda.is_available() else 0
                             acc_str = f"{acc1:.2f}%" if acc1 is not None else "NA"
                             extra = f' ema_acc1={acc1_ema:.2f}%' if acc1_ema is not None else ""
+                            extra2 = (f' emaΔ={ema_delta:.6f}' if ema_delta is not None else "")
                             print(f'epoch {ep+1}/{args.epochs} acc1={acc_str}{extra} '
                                   f'loss={tot_loss/max(1,seen):.4f} '
                                   f'time={dt:.1f}s ({imgs_per_s:.1f} img/s) '
-                                  f'gpu_mem={sizeof_fmt(max_mem)}', flush=True)
+                                  f'gpu_mem={sizeof_fmt(max_mem)}{(" " + extra2) if extra2 else ""}', flush=True)
                             log_dict = {
                                 "loss": float(tot_loss/max(1,seen)),
                                 "imgs_per_s": float(imgs_per_s)
@@ -1553,6 +1609,8 @@ def main():
                                 log_dict["acc1"] = float(acc1)
                             if acc1_ema is not None:
                                 log_dict["acc1_ema"] = float(acc1_ema)
+                            if ema_delta is not None:
+                                log_dict["ema_delta_mean_abs"] = float(ema_delta)
                             mlf.log_metrics(log_dict, step=ep+1)
 
                             # checkpoints (per-config)
